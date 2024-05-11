@@ -111,14 +111,14 @@ def apply_forward_loglikelihood(hf_model,
     return output, past_key_values
 
 
-def apply_forward_lowcoder(hf_model, input_tokens, input_mask, past_key_value, **kwargs):
+def apply_forward_lowcoder(hf_model, input_tokens, input_mask, past_key_values=None, **kwargs):
     # TODO: Apply and other parameters
     # TODO: Output attention
     outputs, past_key_values = hf_model._lowcoder_forward(
         input_ids=torch.Tensor(input_tokens).type(torch.int),
         attention_mask=torch.Tensor(input_mask).type(torch.int),
         deterministic=True,
-        past_key_value=past_key_value,
+        past_key_values=past_key_values,
         **kwargs,
     )
 

@@ -1,30 +1,35 @@
 import json
+import logging
 import warnings
 from collections import namedtuple
 from distutils import dist
 
 import einops
 import gin
+import numpy as np
 import torch
 import transformers
 from torch import nn, Tensor, LongTensor
+from tqdm import trange, tqdm
 from transformers.configuration_utils import PretrainedConfig
 from mlxu import function_args_to_config, load_pickle, open_file
 from ml_collections import ConfigDict
-from typing import Optional, Tuple, Union, Dict, List, Any
+from typing import Optional, Tuple, Union, Dict, List, Any, Literal
 from transformers import AutoTokenizer, StoppingCriteriaList
 from einops import rearrange
 from transformers.generation import validate_stopping_criteria, GenerateEncoderDecoderOutput, GenerateDecoderOnlyOutput
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPastAndCrossAttentions
 from transformers.generation.utils import GenerateNonBeamOutput, GenerateDecoderOnlyOutput, GenerateEncoderDecoderOutput
 
+from EasyLM.models.rpt.quantization import quantize_embeddings
 from EasyLM.torch_utils import make_attention_mask, make_causal_mask, combine_masks, gelu, silu, assign_slice
 from dataclasses import dataclass
 
 # used just for the attention function call
 from EasyLM.torch_attn import dot_product_attention_weights
 
-import jax
+logger = logging.getLogger(__name__)
+
 
 
 RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])
@@ -666,7 +671,7 @@ class RPTAttention(nn.Module):
             causal_mask = self.causal_mask[:, :, :query_length, :key_length]
 
         causal_mask = torch.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-        attention_mask = torch.broadcast_to(attention_mask.unsqueeze(0).unsqueeze(0), causal_mask.shape)
+        attention_mask = torch.broadcast_to(attention_mask.unsqueeze(1).unsqueeze(1), causal_mask.shape)
         attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
 
         attn_pdrop = self.config.attn_pdrop if not deterministic and self.config.attn_pdrop > 0.0 else 0
@@ -865,10 +870,10 @@ class RPTCrossAttention(nn.Module):
 
 
     def _split_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
+        return hidden_states.reshape(hidden_states.shape[:-1] + (self.num_heads, self.head_dim))
 
     def _merge_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
+        return hidden_states.reshape(hidden_states.shape[:-2] + (self.embed_dim,))
 
     def forward(
             self,
@@ -892,8 +897,9 @@ class RPTCrossAttention(nn.Module):
         xk = self._split_heads(xk)
         xv = self._split_heads(xv)
 
-        query_length, key_length = xq.shape[1], xk.shape[1]
-        batch_size = hidden_states.shape[0]
+        query_length, key_length = xq.shape[2], xk.shape[2]
+        batch_size = hidden_states.shape[1]
+        input_count = hidden_states.shape[0]
 
         if position_ids is None:
             position_ids = torch.arange(query_length, dtype=torch.int32)
@@ -911,14 +917,14 @@ class RPTCrossAttention(nn.Module):
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, freqs_cis_k=freqs_cis_k, dtype=self.dtype,
                                       rot_dim=self.config.rot_dim)
 
-        null_k = torch.broadcast_to(self.null_k, (batch_size, 1, self.num_heads, self.head_dim))
+        null_k = torch.broadcast_to(self.null_k, (input_count, batch_size, 1, self.num_heads, self.head_dim))
         xk = torch.concatenate((xk, null_k), dim=-3)
 
-        null_v = torch.broadcast_to(self.null_v, (batch_size, 1, self.num_heads, self.head_dim))
+        null_v = torch.broadcast_to(self.null_v, (input_count, batch_size, 1, self.num_heads, self.head_dim))
         xv = torch.concatenate((xv, null_v), dim=-3)
 
         if attention_mask is not None:
-            null_mask = torch.ones((attention_mask.shape[0], 1), dtype=torch.float32)
+            null_mask = torch.ones((input_count, attention_mask.shape[1], 1), dtype=torch.float32)
             attention_mask = torch.concatenate((attention_mask, null_mask), dim=-1)
             attention_mask = attention_mask.unsqueeze(-2).unsqueeze(-2)
 
@@ -1792,8 +1798,13 @@ class RPTRetriever(nn.Module):
         original_attention_mask_shape = attention_mask.shape
 
         # TODO: verify equivilance
-        original_hidden_states = einops.rearrange(hidden_states, 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size)
-        attention_mask = einops.rearrange(attention_mask, 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size)
+        original_hidden_states, original_attention_mask = [], []
+        for state, mask in zip(hidden_states, attention_mask):
+            original_hidden_states.append(einops.rearrange([state], 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size))
+            original_attention_mask.append(einops.rearrange([mask], 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size))
+
+        original_hidden_states = torch.stack(original_hidden_states)
+        attention_mask = torch.stack(original_attention_mask)
 
         # add a chunk dimension
         # 1. apply bi-dir attention
@@ -1857,14 +1868,11 @@ class RPTPreTrainedModel(PreTrainedModel):
             output_attentions: bool = False,
     ):
 
-        apply_kwargs = self.create_apply_kwargs(params)
-
         outputs = self._encode_forward(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             deterministic=not train,
             output_attentions=output_attentions,
-            **apply_kwargs
         )
 
         return outputs
@@ -1881,8 +1889,6 @@ class RPTPreTrainedModel(PreTrainedModel):
             output_attentions: bool = False
     ):
 
-        apply_kwargs = self.create_apply_kwargs(params, past_key_values)
-
         outputs, past_key_values = self.module.apply(
             hidden_states=hidden_states,
             neighbor_hidden_states=neighbor_hidden_states,
@@ -1890,7 +1896,6 @@ class RPTPreTrainedModel(PreTrainedModel):
             deterministic=not train,
             output_attentions=output_attentions,
             method=self.module._augment_forward,
-            **apply_kwargs
         )
 
         return outputs, past_key_values.get("intermediates", None)
@@ -1906,20 +1911,14 @@ class RPTPreTrainedModel(PreTrainedModel):
             output_attentions: bool = False
     ):
 
-        apply_kwargs = self.create_apply_kwargs(params, past_key_values)
-
-        outputs, past_key_values = self.module.apply(
+        outputs, past_key_values = self.lowcoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             deterministic=not train,
             output_attentions=output_attentions,
-            method=self.module._lowcoder_forward,
-            **apply_kwargs
+            past_key_values=past_key_values
         )
-        return outputs, past_key_values.get("intermediates", None)
-
-    def create_apply_kwargs(self, params, past_key_values=None):
-        return {}
+        return outputs, past_key_values
 
     def sample(
         self,
@@ -2287,13 +2286,10 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
             **kwargs
         )
 
-    def _lowcoder_forward(self, input_ids, attention_mask, past_key_value, **kwargs):
-        """
-
-        """
+    def _lowcoder_forward(self, input_ids, attention_mask, past_key_values, **kwargs):
         lowcoder_outputs = self.transformer.lowcoder(
             self.transformer.wte(input_ids),
-            past_key_value,
+            past_key_values,
             attention_mask,
             init_cache=True,
             **kwargs
@@ -2400,6 +2396,279 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
             retriever_input=outputs.retriever_input,
             past_key_values=outputs.past_key_values,
         )
+    def rolling_iterator(self, text, input_length):
+        tokenizer = self.config.get_tokenizer(truncation_side='right', padding_side='right')
+        inputs = tokenizer(
+            text,
+            padding='longest',
+            truncation=False,
+            max_length=np.iinfo(np.int32).max,
+            return_tensors='np',
+        )
+        batch_size = inputs.input_ids.shape[0]
+
+        output_tokens = inputs.input_ids
+        attention_mask = inputs.attention_mask
+
+        if output_tokens.shape[1] < input_length:
+            padding_length = input_length - output_tokens.shape[1]
+            pad_tokens = np.full(
+                (batch_size, padding_length), tokenizer.pad_token_id, dtype=np.int32
+            )
+            output_tokens = np.concatenate([output_tokens, pad_tokens], axis=-1)
+            pad_mask = np.zeros(
+                (batch_size, padding_length), dtype=inputs.attention_mask.dtype
+            )
+            attention_mask = np.concatenate([attention_mask, pad_mask], axis=-1)
+
+        bos_tokens = np.full(
+            (batch_size, 1), tokenizer.bos_token_id, dtype=np.int32
+        )
+        input_tokens = np.concatenate([bos_tokens, output_tokens[:, :-1]], axis=-1)
+        # bos_mask = np.ones((batch_size, 1), dtype=inputs.attention_mask.dtype)
+        total_input_length = output_tokens.shape[1]
+
+        # Sliding window
+        for i in tqdm(range(0, total_input_length, input_length)):
+            # Last window
+            # TODO: there is a bug here, for ABC, the last window should be BC, not C0 not BC with B padded.
+            if i + input_length > total_input_length:
+                last_output_mask = np.copy(attention_mask[:, -input_length:])
+                last_output_mask[:, :i - total_input_length] = 0.0
+
+                batch = dict(
+                    input_tokens=input_tokens[:, -input_length:].astype(int),
+                    output_tokens=output_tokens[:, -input_length:].astype(int),
+                    input_mask=attention_mask[:, -input_length:].astype(int),
+                    output_mask=last_output_mask.astype(int),
+                )
+
+            # Normal window
+            else:
+                batch = dict(
+                    input_tokens=input_tokens[:, i:i + input_length].astype(int),
+                    output_tokens=output_tokens[:, i:i + input_length].astype(int),
+                    input_mask=attention_mask[:, i:i + input_length].astype(int),
+                    output_mask=attention_mask[:, i:i + input_length].astype(int),
+                )
+            yield batch
+
+    def encode(
+        self,
+        sentences: Union[str, List[str]],
+        prompt: Optional[str] = None,
+        batch_size: int = 32,
+        show_progress_bar: bool = None,
+        output_value: Optional[Literal["sentence_embedding", "token_embeddings"]] = "sentence_embedding",
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = "float32",
+        convert_to_numpy: bool = True,
+        convert_to_tensor: bool = False,
+        device: str = None,
+        normalize_embeddings: bool = False,
+    ) -> Union[List[Tensor], np.ndarray, Tensor]:
+        """
+        Computes sentence embeddings.
+
+        :param sentences: the sentences to embed.
+        :param prompt: The prompt to use for encoding. For example, if the prompt is ``"query: "``, then the
+            sentence "What is the capital of France?" will be encoded as "query: What is the capital of France?"
+            because the sentence is appended to the prompt. If `prompt` is set, `prompt_name` is ignored.
+        :param batch_size: the batch size used for the computation.
+        :param show_progress_bar: Whether to output a progress bar when encode sentences.
+        :param output_value: The type of embeddings to return: "sentence_embedding" to get sentence embeddings,
+            "token_embeddings" to get wordpiece token embeddings, and `None`, to get all output values. Defaults
+            to "sentence_embedding".
+        :param precision: The precision to use for the embeddings. Can be "float32", "int8", "uint8", "binary", or
+            "ubinary". All non-float32 precisions are quantized embeddings. Quantized embeddings are smaller in
+            size and faster to compute, but may have a lower accuracy. They are useful for reducing the size
+            of the embeddings of a corpus for semantic search, among other tasks. Defaults to "float32".
+        :param convert_to_numpy: Whether the output should be a list of numpy vectors. If False, it is a list of PyTorch tensors.
+        :param convert_to_tensor: Whether the output should be one large tensor. Overwrites `convert_to_numpy`.
+        :param device: Which `torch.device` to use for the computation.
+        :param normalize_embeddings: Whether to normalize returned vectors to have length 1. In that case,
+            the faster dot-product (util.dot_score) instead of cosine similarity can be used.
+
+        :return: By default, a 2d numpy array with shape [num_inputs, output_dimension] is returned. If only one string
+            input is provided, then the output is a 1d array with shape [output_dimension]. If `convert_to_tensor`, a
+            torch Tensor is returned instead. If `self.truncate_dim <= output_dimension` then output_dimension is
+            `self.truncate_dim`.
+        """
+
+        # TODO: Utils
+        def truncate_embeddings(
+                embeddings: Union[np.ndarray, torch.Tensor], truncate_dim: Optional[int]
+        ) -> Union[np.ndarray, torch.Tensor]:
+            """
+            :param embeddings: Embeddings to truncate.
+            :param truncate_dim: The dimension to truncate sentence embeddings to. `None` does no truncation.
+            :return: Truncated embeddings.
+            """
+            return embeddings[..., :truncate_dim]
+
+        def batch_to_device(batch, target_device: device):
+            """
+            send a pytorch batch to a device (CPU/GPU)
+            """
+            for key in batch:
+                if isinstance(batch[key], Tensor):
+                    batch[key] = batch[key].to(target_device)
+            return batch
+
+        if self.device.type == "hpu" and not self.is_hpu_graph_enabled:
+            import habana_frameworks.torch as ht
+
+            ht.hpu.wrap_in_hpu_graph(self, disable_tensor_cache=True)
+            self.is_hpu_graph_enabled = True
+
+        def _text_length(text: Union[List[int], List[List[int]]]):
+            """
+            Help function to get the length for the input text. Text can be either
+            a list of ints (which means a single text as input), or a tuple of list of ints
+            (representing several text inputs to the model).
+            """
+
+            if isinstance(text, dict):  # {key: value} case
+                return len(next(iter(text.values())))
+            elif not hasattr(text, "__len__"):  # Object has no len() method
+                return 1
+            elif len(text) == 0 or isinstance(text[0], int):  # Empty string or list of ints
+                return len(text)
+            else:
+                return sum([len(t) for t in text])  # Sum of length of individual strings
+
+        def prepare_prefix(prefix_tokenizer, text, input_length, add_bos_token, device):
+            inputs = prefix_tokenizer(
+                text,
+                padding='max_length',
+                truncation=True,
+                max_length=input_length,
+                return_tensors='np',
+            )
+            input_tokens = inputs.input_ids
+            input_mask = inputs.attention_mask
+            if add_bos_token:
+                input_tokens[:, 0] = prefix_tokenizer.bos_token_id
+                input_mask[:, 0] = 1
+            batch = dict(
+                input_tokens=torch.Tensor(input_tokens).type(torch.int).to(device),
+                input_mask=torch.Tensor(input_mask).type(torch.int).to(device),
+            )
+            return batch
+
+        self.eval()
+        if show_progress_bar is None:
+            show_progress_bar = (
+                logger.getEffectiveLevel() == logging.INFO or logger.getEffectiveLevel() == logging.DEBUG
+            )
+
+        if convert_to_tensor:
+            convert_to_numpy = False
+
+        if output_value != "sentence_embedding":
+            convert_to_tensor = False
+            convert_to_numpy = False
+
+        input_was_string = False
+        if isinstance(sentences, str) or not hasattr(
+            sentences, "__len__"
+        ):  # Cast an individual sentence to a list with length 1
+            sentences = [sentences]
+            input_was_string = True
+
+        extra_features = {}
+        if prompt is not None:
+            sentences = [prompt + sentence for sentence in sentences]
+
+            # TODO: Does the instructor and GRIT method apply here?
+            """
+            # Some models (e.g. INSTRUCTOR, GRIT) require removing the prompt before pooling
+            # Tracking the prompt length allow us to remove the prompt during pooling
+            tokenized_prompt = self.tokenize([prompt])
+            if "input_ids" in tokenized_prompt:
+                extra_features["prompt_length"] = tokenized_prompt["input_ids"].shape[-1] - 1
+            """
+
+        if device is None:
+            device = self.device
+
+        self.to(device)
+
+        all_embeddings = []
+        length_sorted_idx = np.argsort([-_text_length(sen) for sen in sentences])
+        sentences_sorted = [sentences[idx] for idx in length_sorted_idx]
+        tokenizer = self.config.get_tokenizer(truncation_side='right', padding_side='right')
+
+        for start_index in trange(0, len(sentences), batch_size, desc="Batches", disable=not show_progress_bar):
+            sentences_batch = sentences_sorted[start_index : start_index + batch_size]
+            features = [prepare_prefix(tokenizer, sen, self.config.window_length, False, self.device) for sen in sentences_batch]
+            #features = batch_to_device(features, device)
+            #features.update(extra_features)
+
+
+            with torch.no_grad():
+                past_key_values = None
+                out_features = {'sentence_embedding': []}
+                input_tokens, input_masks = [], []
+                for feature in features:
+                    input_tokens.append(feature['input_tokens'].squeeze())
+                    input_masks.append(feature['input_mask'].squeeze())
+
+                out_feature, _  = self._lowcoder_forward(torch.Tensor(np.array(input_tokens)).type(torch.int), torch.Tensor(np.array(input_masks)).type(torch.int), past_key_values, deterministic=True)
+                for key_chunk in out_feature.key_chunks:
+                    out_features['sentence_embedding'].append(key_chunk.flatten()) # TODO: U SURE?
+
+                out_features["sentence_embedding"] = truncate_embeddings(
+                    torch.Tensor(np.array(out_features["sentence_embedding"])), self.config.window_length
+                )
+
+                if output_value == "token_embeddings":
+                    embeddings = []
+                    for token_emb, attention in zip(out_features[output_value], out_features["attention_mask"]):
+                        last_mask_id = len(attention) - 1
+                        while last_mask_id > 0 and attention[last_mask_id].item() == 0:
+                            last_mask_id -= 1
+
+                        embeddings.append(token_emb[0 : last_mask_id + 1])
+                elif output_value is None:  # Return all outputs
+                    embeddings = []
+                    for sent_idx in range(len(out_features["sentence_embedding"])):
+                        row = {name: out_features[name][sent_idx] for name in out_features}
+                        embeddings.append(row)
+                else:  # Sentence embeddings
+                    embeddings = out_features[output_value]
+                    embeddings = embeddings.detach()
+                    if normalize_embeddings:
+                        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+
+                    # fixes for #522 and #487 to avoid oom problems on gpu with large datasets
+                    if convert_to_numpy:
+                        embeddings = embeddings.cpu()
+
+                all_embeddings.extend(embeddings)
+
+        all_embeddings = [all_embeddings[idx] for idx in np.argsort(length_sorted_idx)]
+
+        if precision and precision != "float32":
+            all_embeddings = quantize_embeddings(all_embeddings, precision=precision)
+
+        if convert_to_tensor:
+            if len(all_embeddings):
+                if isinstance(all_embeddings, np.ndarray):
+                    all_embeddings = torch.from_numpy(all_embeddings)
+                else:
+                    all_embeddings = torch.stack(all_embeddings)
+            else:
+                all_embeddings = torch.Tensor()
+        elif convert_to_numpy:
+            if not isinstance(all_embeddings, np.ndarray):
+                all_embeddings = np.asarray([emb.numpy() for emb in all_embeddings])
+        elif isinstance(all_embeddings, np.ndarray):
+            all_embeddings = [torch.from_numpy(embedding) for embedding in all_embeddings]
+
+        if input_was_string:
+            all_embeddings = all_embeddings[0]
+
+        return all_embeddings
 
     def unembed(self, hidden_states):
         if self.config.tie_word_embeddings:
