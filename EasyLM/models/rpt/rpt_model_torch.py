@@ -678,7 +678,6 @@ class RPTAttention(nn.Module):
 
         causal_mask = torch.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
         attention_mask = torch.broadcast_to(attention_mask.unsqueeze(1).unsqueeze(1), causal_mask.shape)
-        print(attention_mask.device, causal_mask.device)
         attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
 
         attn_pdrop = self.config.attn_pdrop if not deterministic and self.config.attn_pdrop > 0.0 else 0
@@ -691,6 +690,7 @@ class RPTAttention(nn.Module):
 
 
         # transform boolean mask into float mask
+        print('4', attention_mask.device)
         attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
         attention_bias[attention_mask > 0] = 0.0
 
