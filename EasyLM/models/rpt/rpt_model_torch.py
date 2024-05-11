@@ -770,7 +770,7 @@ class RPTAttention(nn.Module):
                 dtype=self.dtype,
             )
 
-            print(f"{attn_weights.shape=}")
+            #print(f"{attn_weights.shape=}")
             attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
             if sliding_window and n_windows > 1:
                 attn_output = rearrange(attn_output,
