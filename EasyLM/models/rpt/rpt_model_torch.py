@@ -2627,7 +2627,7 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
                 out_features['sentence_embedding'] = torch.stack(out_features['sentence_embedding'])
 
                 out_features["sentence_embedding"] = truncate_embeddings(
-                    torch.Tensor(np.array(out_features["sentence_embedding"])), self.config.window_length
+                    out_features["sentence_embedding"], self.config.window_length
                 )
 
                 if output_value == "token_embeddings":
