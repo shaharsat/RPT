@@ -691,7 +691,7 @@ class RPTAttention(nn.Module):
 
         # transform boolean mask into float mask
         print('4', attention_mask.device)
-        attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
+        attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype).device('cuda')
         attention_bias[attention_mask > 0] = 0.0
 
         if self.num_key_value_groups > 1:
