@@ -452,8 +452,8 @@ def apply_rotary_emb(
         xq_rot, xk_rot = apply_rotary_emb_(xq_rot, xk_rot, freqs_cis, dtype=dtype, freqs_cis_k=freqs_cis_k)
 
         # Concatenate the rotated and non-rotated parts
-        xq_out = torch.concatenate((xq_rot, xq_pass), dim=-1)
-        xk_out = torch.concatenate((xk_rot, xk_pass), dim=-1)
+        xq_out = torch.cat((xq_rot, xq_pass), dim=-1)
+        xk_out = torch.cat((xk_rot, xk_pass), dim=-1)
     else:
         xq_out, xk_out = apply_rotary_emb_(xq, xk, freqs_cis, dtype=dtype, freqs_cis_k=freqs_cis_k)
 
@@ -734,9 +734,9 @@ class RPTAttention(nn.Module):
                                        (past_xk, past_xv))
                 past_attention_bias = torch.pad(past_attention_bias, [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)],
                                               constant_values=torch.finfo(past_attention_bias.dtype).min)
-                xk = torch.concatenate((past_xk, xk), axis=-3)
-                xv = torch.concatenate((past_xv, xv), axis=-3)
-                attention_bias = torch.concatenate((past_attention_bias, attention_bias), axis=-1)
+                xk = torch.cat((past_xk, xk), axis=-3)
+                xv = torch.cat((past_xv, xv), axis=-3)
+                attention_bias = torch.cat((past_attention_bias, attention_bias), axis=-1)
 
             if self.config.add_null_attn:
                 xv, xk, attention_bias = self.concat_null_kv(xv, xk, attention_bias)
@@ -797,9 +797,9 @@ class RPTAttention(nn.Module):
         null_v = torch.broadcast_to(self.null_v, tuple(xk_shape))
         # xk = torch.Size([1, 1024, 16, 128]), null_k=torch.Size([1, 1, 16, 128])
         # xv = torch.Size([1, 1024, 16, 128]), null_v=torch.Size([1, 1, 16, 128])
-        xk = torch.concatenate((xk, null_k), dim=-3) # torch.Size([1, 1025, 16, 128])
-        xv = torch.concatenate((xv, null_v), dim=-3) # torch.Size([1, 1025, 16, 128])
-        attention_bias = torch.concatenate((attention_bias, torch.full(tuple(attention_bias_shape), 0.0)), dim=-1) # add last dim (embedding?)
+        xk = torch.cat((xk, null_k), dim=-3) # torch.Size([1, 1025, 16, 128])
+        xv = torch.cat((xv, null_v), dim=-3) # torch.Size([1, 1025, 16, 128])
+        attention_bias = torch.cat((attention_bias, torch.full(tuple(attention_bias_shape), 0.0)), dim=-1) # add last dim (embedding?)
         return xv, xk, attention_bias
 
 
@@ -918,14 +918,14 @@ class RPTCrossAttention(nn.Module):
                                       rot_dim=self.config.rot_dim)
 
         null_k = torch.broadcast_to(self.null_k, (input_count, batch_size, 1, self.num_heads, self.head_dim))
-        xk = torch.concatenate((xk, null_k), dim=-3)
+        xk = torch.cat((xk, null_k), dim=-3)
 
         null_v = torch.broadcast_to(self.null_v, (input_count, batch_size, 1, self.num_heads, self.head_dim))
-        xv = torch.concatenate((xv, null_v), dim=-3)
+        xv = torch.cat((xv, null_v), dim=-3)
 
         if attention_mask is not None:
             null_mask = torch.ones((input_count, attention_mask.shape[1], 1), dtype=torch.float32)
-            attention_mask = torch.concatenate((attention_mask, null_mask), dim=-1)
+            attention_mask = torch.cat((attention_mask, null_mask), dim=-1)
             attention_mask = attention_mask.unsqueeze(-2).unsqueeze(-2)
 
             attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
