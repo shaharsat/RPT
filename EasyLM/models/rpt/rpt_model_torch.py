@@ -530,7 +530,7 @@ class RPTAttention(nn.Module):
             rot_dim,
             config.max_sequence_length * 2,
             dtype=self.dtype,
-            device=device,
+            device='cuda',
         )
         if self.config.add_null_attn:
             #self.null_k = self.param(f'null_k', nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
