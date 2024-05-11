@@ -2457,7 +2457,7 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
         self,
         sentences: Union[str, List[str]],
         prompt: Optional[str] = None,
-        batch_size: int = 1,
+        batch_size: int = 32,
         show_progress_bar: bool = None,
         output_value: Optional[Literal["sentence_embedding", "token_embeddings"]] = "sentence_embedding",
         precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = "float32",
@@ -2493,6 +2493,8 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
             torch Tensor is returned instead. If `self.truncate_dim <= output_dimension` then output_dimension is
             `self.truncate_dim`.
         """
+
+        batch_size = 1
 
         # TODO: Utils
         def truncate_embeddings(
