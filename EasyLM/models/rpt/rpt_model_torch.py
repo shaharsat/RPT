@@ -396,6 +396,7 @@ def apply_rotary_emb_(
     freqs_cis = torch.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
 
     # freqs_cis = (1, 1024, 1, 64)
+    print('3', xq_.device, freqs_cis.device)
     xq_out = xq_ * freqs_cis
     xq_out = torch.stack((torch.real(xq_out), torch.imag(xq_out)), dim=-1).reshape(*xq_out.shape[:-1], -1)
     if freqs_cis_k is None:
