@@ -746,6 +746,7 @@ class RPTAttention(nn.Module):
                 attention_bias = torch.cat((past_attention_bias, attention_bias), axis=-1)
 
             if self.config.add_null_attn:
+                print('5', attention_bias.device)
                 xv, xk, attention_bias = self.concat_null_kv(xv, xk, attention_bias)
 
 
@@ -766,6 +767,8 @@ class RPTAttention(nn.Module):
             
             attn_weights = torch.Tensor(attn_weights.tolist())
             """
+
+            print(xq.device, xk.device, attention_bias.device)
 
             # TODO: Handle dropout
             attn_weights = dot_product_attention_weights(
