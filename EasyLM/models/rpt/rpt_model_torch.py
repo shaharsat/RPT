@@ -2599,6 +2599,7 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
         tokenizer = self.config.get_tokenizer(truncation_side='right', padding_side='right')
 
         for start_index in trange(0, len(sentences), batch_size, desc="Batches", disable=not show_progress_bar):
+            print(start_index, len(sentences))
             sentences_batch = sentences_sorted[start_index : start_index + batch_size]
             features = [prepare_prefix(tokenizer, sen, self.config.window_length, False, self.device) for sen in sentences_batch]
             #features = batch_to_device(features, device)
