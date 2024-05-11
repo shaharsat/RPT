@@ -2613,8 +2613,8 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
                     input_tokens.append(feature['input_tokens'].squeeze())
                     input_masks.append(feature['input_mask'].squeeze())
 
-                print(np.array(input_tokens).shape)
-                print(np.array(input_masks).shape)
+                input_tokens = torch.stack(input_tokens)
+                input_masks = torch.stack(input_masks)
 
                 out_feature, _  = self._lowcoder_forward(
                     torch.Tensor(np.array(input_tokens)).type(torch.int),
