@@ -14,5 +14,5 @@ model.to(device)
 #model.encode(['hello world', 'this is a test'])
 
 evaluation = MTEB(tasks=["Banking77Classification"])
-results = evaluation.run(model, output_folder=f"results/rpt", batch_size=2, show_progress_bar=True)
+results = evaluation.run(model, output_folder=f"results/rpt", batch_size=3, show_progress_bar=True)
 
