@@ -2457,7 +2457,7 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
         self,
         sentences: Union[str, List[str]],
         prompt: Optional[str] = None,
-        batch_size: int = 32,
+        batch_size: int = 1,
         show_progress_bar: bool = None,
         output_value: Optional[Literal["sentence_embedding", "token_embeddings"]] = "sentence_embedding",
         precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = "float32",
