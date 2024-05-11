@@ -7,7 +7,7 @@ model = RPTForCausalLM.from_pretrained('shahar603/rpt-torch-1')
 
 import torch
 for i in range(torch.cuda.device_count()):
-   print(torch.cuda.get_device_properties(i).name)
+   print(torch.cuda.get_device_properties(i))
 
 model.to('cuda')
 #model.push_to_hub(repo_id="rpt-torch-1", token='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')
