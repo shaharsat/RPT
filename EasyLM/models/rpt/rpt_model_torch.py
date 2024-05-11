@@ -563,9 +563,10 @@ class RPTAttention(nn.Module):
             presets = ({'xk': past_xk, 'xv': past_xv, 'cache_mask': past_attention_mask},)
             return self._concatenate_to_cache(key, value, query, attention_mask, presets)
 
-        past_key = layer_past[0]['xk'] if layer_past is not None and 'xk' in layer_past[0] else torch.zeros(key.shape, dtype=key.dtype, device=self.device)
-        past_value = layer_past[0]['xv'] if layer_past is not None and 'xv' in layer_past[0] else torch.zeros(value.shape, dtype=key.dtype, device=self.device)
-        cache_mask = layer_past[0]['cache_mask'] if layer_past is not None and 'cache_mask' in layer_past[0] else torch.zeros(attention_mask.shape, dtype=key.dtype, device=self.device)
+        # TODO: Replace cuda
+        past_key = layer_past[0]['xk'] if layer_past is not None and 'xk' in layer_past[0] else torch.zeros(key.shape, dtype=key.dtype, device='cuda')
+        past_value = layer_past[0]['xv'] if layer_past is not None and 'xv' in layer_past[0] else torch.zeros(value.shape, dtype=key.dtype, device='cuda')
+        cache_mask = layer_past[0]['cache_mask'] if layer_past is not None and 'cache_mask' in layer_past[0] else torch.zeros(attention_mask.shape, dtype=key.dtype, device='cuda')
 
         print('self.device', self.device)
 

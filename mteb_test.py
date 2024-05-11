@@ -3,8 +3,6 @@ from mteb import MTEB
 
 from EasyLM.models.rpt.rpt_model_torch import RPTForCausalLM
 
-torch.set_default_device('cuda')
-
 model = RPTForCausalLM.from_pretrained('shahar603/rpt-torch-1')
 model.to('cuda')
 #model.push_to_hub(repo_id="rpt-torch-1", token='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')
