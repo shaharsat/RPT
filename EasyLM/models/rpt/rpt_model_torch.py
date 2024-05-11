@@ -875,8 +875,8 @@ class RPTCrossAttention(nn.Module):
             dtype=self.dtype,
             device='cuda',
         )
-        self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
-        self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
+        self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim), device='cuda'))
+        self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim), device='cuda'))
 
 
     def _split_heads(self, hidden_states):
