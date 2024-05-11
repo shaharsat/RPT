@@ -912,7 +912,7 @@ class RPTCrossAttention(nn.Module):
         input_count = hidden_states.shape[0]
 
         if position_ids is None:
-            position_ids = torch.arange(query_length, dtype=torch.long)
+            position_ids = torch.arange(query_length, dtype=torch.long, device='cuda')
             position_ids = torch.broadcast_to(position_ids[None, :], (batch_size, query_length))
 
         freqs_cis = self.freqs_cis[position_ids]
@@ -920,7 +920,7 @@ class RPTCrossAttention(nn.Module):
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype, rot_dim=self.config.rot_dim)
         else:
             if kv_position_ids is None:
-                kv_position_ids = torch.arange(key_length, dtype=torch.long)
+                kv_position_ids = torch.arange(key_length, dtype=torch.long, device='cuda')
                 kv_position_ids = torch.broadcast_to(kv_position_ids[None, :], (batch_size, key_length))
             freqs_cis_k = self.freqs_cis[kv_position_ids]
 
