@@ -809,7 +809,7 @@ class RPTAttention(nn.Module):
         # xv = torch.Size([1, 1024, 16, 128]), null_v=torch.Size([1, 1, 16, 128])
         xk = torch.cat((xk, null_k), dim=-3) # torch.Size([1, 1025, 16, 128])
         xv = torch.cat((xv, null_v), dim=-3) # torch.Size([1, 1025, 16, 128])
-        attention_bias = torch.cat((attention_bias, torch.full(tuple(attention_bias_shape), 0.0)), dim=-1) # add last dim (embedding?)
+        attention_bias = torch.cat((attention_bias, torch.full(tuple(attention_bias_shape), 0.0, device='cuda')), dim=-1) # add last dim (embedding?)
         return xv, xk, attention_bias
 
 
