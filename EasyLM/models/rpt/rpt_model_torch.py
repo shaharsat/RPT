@@ -2624,6 +2624,7 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
                 )
                 for key_chunk in out_feature.key_chunks:
                     out_features['sentence_embedding'].append(key_chunk.flatten()) # TODO: U SURE?
+                out_features['sentence_embedding'] = torch.stack(out_features['sentence_embedding'])
 
                 out_features["sentence_embedding"] = truncate_embeddings(
                     torch.Tensor(np.array(out_features["sentence_embedding"])), self.config.window_length
