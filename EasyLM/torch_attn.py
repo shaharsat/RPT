@@ -61,7 +61,6 @@ def dot_product_attention_weights(
 
   # apply attention bias: masking, dropout, proximity bias, etc.
   if bias is not None:
-    print(attn_weights.shape, bias.shape)
     attn_weights = attn_weights + bias
   # apply attention mask
   if mask is not None:
