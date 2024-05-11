@@ -396,7 +396,6 @@ def apply_rotary_emb_(
     freqs_cis = torch.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
 
     # freqs_cis = (1, 1024, 1, 64)
-    print('3', xq_.device, freqs_cis.device)
     xq_out = xq_ * freqs_cis
     xq_out = torch.stack((torch.real(xq_out), torch.imag(xq_out)), dim=-1).reshape(*xq_out.shape[:-1], -1)
     if freqs_cis_k is None:
@@ -449,7 +448,6 @@ def apply_rotary_emb(
         # freqs_k_rot = freqs_k[..., :rot_dim] if freqs_k is not None else None
 
         # Apply the function on the parts that need rotation
-        print(freqs_cis.shape, xq_rot.shape, xk_rot.shape)
         xq_rot, xk_rot = apply_rotary_emb_(xq_rot, xk_rot, freqs_cis, dtype=dtype, freqs_cis_k=freqs_cis_k)
 
         # Concatenate the rotated and non-rotated parts
@@ -569,8 +567,6 @@ class RPTAttention(nn.Module):
         past_value = layer_past[0]['xv'] if layer_past is not None and 'xv' in layer_past[0] else torch.zeros(value.shape, dtype=key.dtype, device='cuda')
         cache_mask = layer_past[0]['cache_mask'] if layer_past is not None and 'cache_mask' in layer_past[0] else torch.zeros(attention_mask.shape, dtype=key.dtype, device='cuda')
 
-        print('self.device', self.device)
-
         # detect if we're initializing by absence of existing cache data.
         is_initialized = past_key is not None
         cached_key = past_key
@@ -626,8 +622,6 @@ class RPTAttention(nn.Module):
     ):
         n_windows = self.config.n_windows
         # stride = self.config.stride if not disable_cache else None
-
-        print('2', hidden_states.device, attention_mask.device)
 
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
@@ -690,7 +684,6 @@ class RPTAttention(nn.Module):
 
 
         # transform boolean mask into float mask
-        print('4', attention_mask.device)
         attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min, device='cuda').type(self.dtype)
         attention_bias[attention_mask > 0] = 0.0
 
@@ -746,7 +739,6 @@ class RPTAttention(nn.Module):
                 attention_bias = torch.cat((past_attention_bias, attention_bias), axis=-1)
 
             if self.config.add_null_attn:
-                print('5', attention_bias.device)
                 xv, xk, attention_bias = self.concat_null_kv(xv, xk, attention_bias)
 
 
@@ -767,8 +759,6 @@ class RPTAttention(nn.Module):
             
             attn_weights = torch.Tensor(attn_weights.tolist())
             """
-
-            print(xq.device, xk.device, attention_bias.device)
 
             # TODO: Handle dropout
             attn_weights = dot_product_attention_weights(
