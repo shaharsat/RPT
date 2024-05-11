@@ -2494,8 +2494,6 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
             `self.truncate_dim`.
         """
 
-        batch_size = 1
-
         # TODO: Utils
         def truncate_embeddings(
                 embeddings: Union[np.ndarray, torch.Tensor], truncate_dim: Optional[int]
