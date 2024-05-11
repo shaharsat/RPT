@@ -13,7 +13,7 @@ model.to(device)
 #model = SentenceTransformer(model_name)
 
 evaluation = MTEB(tasks=["Banking77Classification"])
-results = evaluation.run(model, output_folder=f"results/rpt", batch_size=3, show_progress_bar=True)
+results = evaluation.run(model, output_folder=f"results/rpt", batch_size=8, show_progress_bar=True)
 
 
 
