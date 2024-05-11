@@ -567,6 +567,8 @@ class RPTAttention(nn.Module):
         past_value = layer_past[0]['xv'] if layer_past is not None and 'xv' in layer_past[0] else torch.zeros(value.shape, dtype=key.dtype, device=self.device)
         cache_mask = layer_past[0]['cache_mask'] if layer_past is not None and 'cache_mask' in layer_past[0] else torch.zeros(attention_mask.shape, dtype=key.dtype, device=self.device)
 
+        print('self.device', self.device)
+
         # detect if we're initializing by absence of existing cache data.
         is_initialized = past_key is not None
         cached_key = past_key
@@ -623,7 +625,7 @@ class RPTAttention(nn.Module):
         n_windows = self.config.n_windows
         # stride = self.config.stride if not disable_cache else None
 
-        print(hidden_states.device, attention_mask.device)
+        print('2', hidden_states.device, attention_mask.device)
 
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
@@ -1056,9 +1058,6 @@ class RPTLowcoderLayer(nn.Module):
             output_attentions: bool = False,
             fcm_mask: Optional[torch.Tensor] = None,
     ):
-
-        print(f'1: {attention_mask.device}')
-
         # run self attention on the hidden states
         attn_outputs = self.attention(
             self.attention_norm(hidden_states),
