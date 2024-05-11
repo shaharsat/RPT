@@ -643,7 +643,7 @@ class RPTAttention(nn.Module):
         position_ids = torch.broadcast_to(
             torch.clip(torch.cumsum(query_attention_mask, dim=-1) - 1, min=0),
             (batch_size, query_length)
-        ).type(torch.int)
+        ).type(torch.long)
 
         if key_length != query_length:
             position_ids_k = torch.broadcast_to(
