@@ -1937,7 +1937,7 @@ class RPTPreTrainedModel(PreTrainedModel):
         synced_gpus: bool = False,
         streamer: Optional["BaseStreamer"] = None,
         **model_kwargs,
-    ) -> Union[tuple[GenerateEncoderDecoderOutput, Any], tuple[GenerateDecoderOnlyOutput, Any], tuple[
+    ) -> Union[Tuple[GenerateEncoderDecoderOutput, Any], Tuple[GenerateDecoderOnlyOutput, Any], Tuple[
         Union[Tensor, LongTensor], Any]]:
         # init values
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
