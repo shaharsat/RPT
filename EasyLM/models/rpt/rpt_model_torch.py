@@ -873,7 +873,7 @@ class RPTCrossAttention(nn.Module):
             rot_dim,
             config.max_sequence_length * 2,
             dtype=self.dtype,
-            device=device,
+            device='cuda',
         )
         self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
         self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
@@ -938,7 +938,7 @@ class RPTCrossAttention(nn.Module):
             attention_mask = torch.cat((attention_mask, null_mask), dim=-1)
             attention_mask = attention_mask.unsqueeze(-2).unsqueeze(-2)
 
-            attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
+            attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min, device='cuda').type(self.dtype)
             attention_bias[attention_mask > 0] = 0.0
         else:
             attention_bias = None
