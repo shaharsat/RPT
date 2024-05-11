@@ -2613,7 +2613,14 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
                     input_tokens.append(feature['input_tokens'].squeeze())
                     input_masks.append(feature['input_mask'].squeeze())
 
-                out_feature, _  = self._lowcoder_forward(torch.Tensor(np.array(input_tokens)).type(torch.int), torch.Tensor(np.array(input_masks)).type(torch.int), past_key_values, deterministic=True)
+                print(np.array(input_tokens))
+                print(np.array(input_masks))
+                out_feature, _  = self._lowcoder_forward(
+                    torch.Tensor(np.array(input_tokens)).type(torch.int),
+                    torch.Tensor(np.array(input_masks)).type(torch.int),
+                    past_key_values,
+                    deterministic=True
+                )
                 for key_chunk in out_feature.key_chunks:
                     out_features['sentence_embedding'].append(key_chunk.flatten()) # TODO: U SURE?
 
