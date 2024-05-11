@@ -623,6 +623,8 @@ class RPTAttention(nn.Module):
         n_windows = self.config.n_windows
         # stride = self.config.stride if not disable_cache else None
 
+        print(hidden_states.device, attention_mask.device)
+
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
         xq = self._split_heads(xq)
@@ -2616,9 +2618,6 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
 
                 input_tokens = torch.stack(input_tokens)
                 input_masks = torch.stack(input_masks)
-
-                print(input_tokens.device)
-                print(input_masks.device)
 
                 out_feature, _  = self._lowcoder_forward(
                     input_tokens.type(torch.int),
