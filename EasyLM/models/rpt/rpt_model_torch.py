@@ -1056,6 +1056,9 @@ class RPTLowcoderLayer(nn.Module):
             output_attentions: bool = False,
             fcm_mask: Optional[torch.Tensor] = None,
     ):
+
+        print(f'1: {attention_mask.device}')
+
         # run self attention on the hidden states
         attn_outputs = self.attention(
             self.attention_norm(hidden_states),
@@ -1217,8 +1220,6 @@ class RPTLowcoder(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
     ):
-        print(attention_mask.device)
-
         outputs = self.layers(
             hidden_states,
             past_key_values,
