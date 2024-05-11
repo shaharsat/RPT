@@ -7,10 +7,10 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model.to(device)
 #model.encode(['hello world', 'this is a test'])
 
-from sentence_transformers import SentenceTransformer
+#from sentence_transformers import SentenceTransformer
 
-model_name = "average_word_embeddings_komninos"
-model = SentenceTransformer(model_name)
+#model_name = "average_word_embeddings_komninos"
+#model = SentenceTransformer(model_name)
 
 evaluation = MTEB(tasks=["Banking77Classification"])
 results = evaluation.run(model, output_folder=f"results/rpt", batch_size=3, show_progress_bar=True)
