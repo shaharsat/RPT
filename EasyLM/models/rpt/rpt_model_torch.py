@@ -1217,6 +1217,8 @@ class RPTLowcoder(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
     ):
+        print(attention_mask.device)
+
         outputs = self.layers(
             hidden_states,
             past_key_values,
