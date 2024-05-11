@@ -528,7 +528,7 @@ class RPTAttention(nn.Module):
             rot_dim,
             config.max_sequence_length * 2,
             dtype=self.dtype,
-            device='cuda:1',
+            device='cuda',
         )
         if self.config.add_null_attn:
             #self.null_k = self.param(f'null_k', nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
@@ -563,9 +563,9 @@ class RPTAttention(nn.Module):
             return self._concatenate_to_cache(key, value, query, attention_mask, presets)
 
         # TODO: Replace cuda
-        past_key = layer_past[0]['xk'] if layer_past is not None and 'xk' in layer_past[0] else torch.zeros(key.shape, dtype=key.dtype, device='cuda:1')
-        past_value = layer_past[0]['xv'] if layer_past is not None and 'xv' in layer_past[0] else torch.zeros(value.shape, dtype=key.dtype, device='cuda:1')
-        cache_mask = layer_past[0]['cache_mask'] if layer_past is not None and 'cache_mask' in layer_past[0] else torch.zeros(attention_mask.shape, dtype=key.dtype, device='cuda:1')
+        past_key = layer_past[0]['xk'] if layer_past is not None and 'xk' in layer_past[0] else torch.zeros(key.shape, dtype=key.dtype, device='cuda')
+        past_value = layer_past[0]['xv'] if layer_past is not None and 'xv' in layer_past[0] else torch.zeros(value.shape, dtype=key.dtype, device='cuda')
+        cache_mask = layer_past[0]['cache_mask'] if layer_past is not None and 'cache_mask' in layer_past[0] else torch.zeros(attention_mask.shape, dtype=key.dtype, device='cuda')
 
         # detect if we're initializing by absence of existing cache data.
         is_initialized = past_key is not None
@@ -684,7 +684,7 @@ class RPTAttention(nn.Module):
 
 
         # transform boolean mask into float mask
-        attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min, device='cuda:1').type(self.dtype)
+        attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min, device='cuda').type(self.dtype)
         attention_bias[attention_mask > 0] = 0.0
 
         if self.num_key_value_groups > 1:
@@ -799,7 +799,7 @@ class RPTAttention(nn.Module):
         # xv = torch.Size([1, 1024, 16, 128]), null_v=torch.Size([1, 1, 16, 128])
         xk = torch.cat((xk, null_k), dim=-3) # torch.Size([1, 1025, 16, 128])
         xv = torch.cat((xv, null_v), dim=-3) # torch.Size([1, 1025, 16, 128])
-        attention_bias = torch.cat((attention_bias, torch.full(tuple(attention_bias_shape), 0.0, device='cuda:1')), dim=-1) # add last dim (embedding?)
+        attention_bias = torch.cat((attention_bias, torch.full(tuple(attention_bias_shape), 0.0, device='cuda')), dim=-1) # add last dim (embedding?)
         return xv, xk, attention_bias
 
 
@@ -863,10 +863,10 @@ class RPTCrossAttention(nn.Module):
             rot_dim,
             config.max_sequence_length * 2,
             dtype=self.dtype,
-            device='cuda:1',
+            device='cuda',
         )
-        self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim), device='cuda:1'))
-        self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim), device='cuda:1'))
+        self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim), device='cuda'))
+        self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim), device='cuda'))
 
 
     def _split_heads(self, hidden_states):
@@ -902,7 +902,7 @@ class RPTCrossAttention(nn.Module):
         input_count = hidden_states.shape[0]
 
         if position_ids is None:
-            position_ids = torch.arange(query_length, dtype=torch.long, device='cuda:1')
+            position_ids = torch.arange(query_length, dtype=torch.long, device='cuda')
             position_ids = torch.broadcast_to(position_ids[None, :], (batch_size, query_length))
 
         freqs_cis = self.freqs_cis[position_ids]
@@ -910,7 +910,7 @@ class RPTCrossAttention(nn.Module):
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype, rot_dim=self.config.rot_dim)
         else:
             if kv_position_ids is None:
-                kv_position_ids = torch.arange(key_length, dtype=torch.long, device='cuda:1')
+                kv_position_ids = torch.arange(key_length, dtype=torch.long, device='cuda')
                 kv_position_ids = torch.broadcast_to(kv_position_ids[None, :], (batch_size, key_length))
             freqs_cis_k = self.freqs_cis[kv_position_ids]
 
@@ -924,11 +924,11 @@ class RPTCrossAttention(nn.Module):
         xv = torch.cat((xv, null_v), dim=-3)
 
         if attention_mask is not None:
-            null_mask = torch.ones((input_count, attention_mask.shape[1], 1), dtype=torch.float32, device='cuda:1')
+            null_mask = torch.ones((input_count, attention_mask.shape[1], 1), dtype=torch.float32, device='cuda')
             attention_mask = torch.cat((attention_mask, null_mask), dim=-1)
             attention_mask = attention_mask.unsqueeze(-2).unsqueeze(-2)
 
-            attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min, device='cuda:1').type(self.dtype)
+            attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min, device='cuda').type(self.dtype)
             attention_bias[attention_mask > 0] = 0.0
         else:
             attention_bias = None

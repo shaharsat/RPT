@@ -6,7 +6,7 @@ from EasyLM.models.rpt.rpt_model_torch import RPTForCausalLM
 
 model = RPTForCausalLM.from_pretrained('shahar603/rpt-torch-1')
 
-device = 'cuda:1' if torch.cuda.is_available() else 'cpu'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model.to(device)
 
 #model.push_to_hub(repo_id="rpt-torch-1", token='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')
