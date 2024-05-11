@@ -2617,8 +2617,8 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
                 input_masks = torch.stack(input_masks)
 
                 out_feature, _  = self._lowcoder_forward(
-                    torch.Tensor(np.array(input_tokens)).type(torch.int),
-                    torch.Tensor(np.array(input_masks)).type(torch.int),
+                    input_tokens.type(torch.int),
+                    input_masks.type(torch.int),
                     past_key_values,
                     deterministic=True
                 )
