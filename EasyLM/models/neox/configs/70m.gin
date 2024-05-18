@@ -1,0 +1,2 @@
+TrainConfig.lr=10e-4
+TrainConfig.size="70m"
