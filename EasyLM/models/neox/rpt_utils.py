@@ -3,13 +3,11 @@ import numpy as np
 import jax.numpy as jnp
 from transformers.utils import ModelOutput
 import jax
-#from EasyLM.sliding_window import sliding_window
+from EasyLM.sliding_window import sliding_window
 from more_itertools import chunked
 import tqdm
 
 
-def sliding_window(*args, **kwargs):
-    return args[0]
 
 def tree_unstack(tree):
     leaves, treedef = jax.tree_util.tree_flatten(tree)

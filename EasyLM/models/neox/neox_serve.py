@@ -34,7 +34,7 @@ from EasyLM.models.neox.neox_model import (
     GPTNeoXConfig, FlaxGPTNeoXForCausalLMModule,RetrieverSupervision, ranksigrelu, FlaxGPTNeoXForCausalLM
 )
 from flax.training import common_utils
-from EasyLM.jax_utils import unshard, reshape_for_vmap
+from EasyLM.jax_utils import reshape_for_vmap
 
 from EasyLM.trainer_utils import parse_overrides
 
@@ -48,7 +48,7 @@ from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from EasyLM.models.neox.rpt_utils import batch_lookup_neighbors,add_batch_index,collate_fn,tree_unstack,batch_encode_memories,create_prepare_inputs
 from more_itertools import chunked
 from functools import partial
-
+from transformers import AutoModel
 
 from dataclasses import dataclass
 
@@ -79,6 +79,16 @@ class Config:
 def load_model(config):
     JaxDistributedConfig.initialize()
     set_random_seed(config.seed)
+
+    hf_model = FlaxGPTNeoXForCausalLM.from_pretrained('iohadrubin/rpt-2-1.6b_7529ebf46738fdc75e44')
+    prefix_tokenizer = hf_model.config.get_tokenizer(truncation_side='left', padding_side='left')
+    tokenizer = hf_model.config.get_tokenizer(truncation_side='right', padding_side='right')
+    params = hf_model.params
+    rng_keys = hf_model.config.rng_keys()
+
+    print('.')
+
+    """
     model_cfg = GPTNeoXConfig.load_config(config.model_config_path)
     model_cfg.update(parse_overrides(config.config_override))
     prefix_tokenizer = model_cfg.get_tokenizer(truncation_side='left', padding_side='left')
@@ -108,22 +118,18 @@ def load_model(config):
                 _do_init=False
             )
         rng_keys = model_cfg.rng_keys()
-    params = unfreeze(params)
+     
     model_ps = match_partition_rules(
         GPTNeoXConfig.get_partition_rules(), params
     )
     shard_fns, _ = make_shard_and_gather_fns(
         model_ps, get_float_dtype_by_name(config.dtype)
     )
+    """
     
 
         
-    
-    @partial(
-        pjit,
-        in_shardings=(model_ps, PS(), PS()),
-        out_shardings=(PS(), PS(), PS())
-    )
+
     def forward_loglikelihood(params, rng, batch):
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         rng_generator = JaxRNG(rng)
@@ -149,11 +155,6 @@ def load_model(config):
         return loglikelihood, is_greedy, rng_generator()
 
 
-    @partial(
-        pjit,
-        in_shardings=(model_ps, PS(), PS(), PS()),
-        out_shardings=(PS(), PS())
-    )
     def forward_generate(params, rng, batch, temperature):
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         rng_generator = JaxRNG(rng)
@@ -178,11 +179,7 @@ def load_model(config):
         ).sequences[:, batch['input_tokens'].shape[1]:]
         return output, rng_generator()
 
-    @partial(
-        pjit,
-        in_shardings=(model_ps, PS(), PS()),
-        out_shardings=(PS(), PS())
-    )
+
     def forward_greedy_generate(params, rng, batch):
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         rng_generator = JaxRNG(rng)
@@ -204,18 +201,12 @@ def load_model(config):
         return output, rng_generator()
     
 
-    def create_lowcoder_forward(mesh):
-        @partial(
-            pjit,
-            in_shardings=(model_ps, PS()),
-            out_shardings=(PS())
-        )
+    def create_lowcoder_forward():
         def apply_forward(params, batch):
             return hf_model.batch_lowcoder_forward(batch["input_ids"], batch["attention_mask"],params=params)
         def forward(input_ids,attention_mask,params):
             batch = {"input_ids": input_ids, "attention_mask": attention_mask}
-            with mesh:
-                output = apply_forward(params, batch)
+            output = apply_forward(params, batch)
             return output
 
         forward = flax.jax_utils.pad_shard_unpad(forward, static_argnums=(2,), static_argnames=("params",))
@@ -223,12 +214,7 @@ def load_model(config):
 
 
 
-    def create_greedy(mesh):
-        @partial(
-            pjit,
-            in_shardings=(model_ps, PS()),
-            out_shardings=(PS())
-        )
+    def create_greedy():
         def apply_forward(params, batch):
             batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
             def fwd(input_ids, attention_mask, encoded_neighbors):
@@ -246,8 +232,7 @@ def load_model(config):
         def forward(input_ids, attention_mask, params, encoded_neighbors):
             
             batch = {"input_ids": input_ids, "encoded_neighbors":encoded_neighbors, "attention_mask": attention_mask}
-            with mesh:
-                output = apply_forward(params, batch)
+            output = apply_forward(params, batch)
             output = jax.device_get(output)
             assert len(output.shape)==3
             assert output.shape[1]==1
@@ -261,15 +246,11 @@ def load_model(config):
             return [x.strip() for x in all_outputs]
             
         return forward
-    
 
-    mesh = GPTNeoXConfig.get_jax_mesh(config.mesh_dim)
-    with mesh:
-        params = tree_apply(shard_fns, params)
-        sharded_rng = next_rng()
+    sharded_rng = next_rng()
         
-    greedy_w_cache = create_greedy(mesh)
-    lowcoder_forward = create_lowcoder_forward(mesh)
+    greedy_w_cache = create_greedy()
+    lowcoder_forward = create_lowcoder_forward()
     prepare_inputs = create_prepare_inputs(prefix_tokenizer, input_length=config.input_length)
     # params = dict(params=params)
     # lowcoder_forward = partial(lowcoder_forward,params=params)
@@ -314,16 +295,13 @@ def load_model(config):
             input_mask=input_mask,
             output_mask=output_mask,
         )
-        with mesh:
-            loglikelihood, is_greedy, sharded_rng = forward_loglikelihood(
-                params, sharded_rng, batch
-            )
-            loglikelihood, is_greedy = jax.device_get((loglikelihood, is_greedy))
+        loglikelihood, is_greedy, sharded_rng = forward_loglikelihood(params, sharded_rng, batch)
+        loglikelihood, is_greedy = jax.device_get((loglikelihood, is_greedy))
         return loglikelihood, is_greedy
 
 
     def _loglikelihood_rolling(text):
-        nonlocal sharded_rng
+        
         inputs = tokenizer(
             text,
             padding='longest',
@@ -378,11 +356,10 @@ def load_model(config):
                     output_mask=attention_mask[:, i:i + config.seq_length],
                 )
 
-            with mesh:
-                loglikelihood, is_greedy, sharded_rng = forward_loglikelihood(
-                    params, sharded_rng, batch
-                )
-                loglikelihood, is_greedy = jax.device_get((loglikelihood, is_greedy))
+            loglikelihood, is_greedy, sharded_rng = forward_loglikelihood(
+                params, sharded_rng, batch
+            )
+            loglikelihood, is_greedy = jax.device_get((loglikelihood, is_greedy))
 
             total_loglikelihood += loglikelihood
             total_is_greedy = np.logical_and(is_greedy, total_is_greedy)
@@ -391,9 +368,10 @@ def load_model(config):
 
 
     def _generate(text, temperature):
+        nonlocal sharded_rng
         if config.return_empty:
             return ["" for _ in text]
-        nonlocal sharded_rng
+        
         inputs = prefix_tokenizer(
             text,
             padding='max_length',
@@ -413,11 +391,10 @@ def load_model(config):
             attention_mask=input_mask,
         )
         print(batch)
-        with mesh:
-            output, sharded_rng = forward_generate(
-                params, sharded_rng, batch, temperature
-            )
-            output = jax.device_get(output)
+        output, sharded_rng = forward_generate(
+            params, sharded_rng, batch, temperature
+        )
+        output = jax.device_get(output)
         output_text = []
         for text in list(tokenizer.batch_decode(output)):
             if tokenizer.eos_token in text:
@@ -428,7 +405,7 @@ def load_model(config):
 
 
     def _old_greedy_until(prefix_text, until, max_length, pre_compile=False):
-        nonlocal sharded_rng
+        
         all_outputs = []
         for pf, ut in zip(prefix_text, until):
             if isinstance(ut, str):
@@ -471,14 +448,13 @@ def load_model(config):
 
                 batch = dict(input_tokens=input_tokens, attention_mask=attention_mask)
 
-                with mesh:
-                    # print(batch)
-                    output, sharded_rng = forward_greedy_generate(
-                        params, sharded_rng, batch
-                    )
-                    # print(output)
-                    output = jax.device_get(output)
-                    # print(output)
+                # print(batch)
+                output, sharded_rng = forward_greedy_generate(
+                   params, sharded_rng, batch
+                )
+                # print(output)
+                output = jax.device_get(output)
+                # print(output)
 
                 total_length += output.shape[1]
                 output_text = tokenizer.batch_decode(output)[0]
@@ -502,7 +478,7 @@ def load_model(config):
     def _greedy_until(prefix_text, until, max_length, pre_compile=False):
         if config.return_empty:
             return ["" for _ in prefix_text]
-        nonlocal sharded_rng
+        
         num_neighbors  = config.num_neighbors
         split_by_newline= config.split_by_newline
         # if False:

@@ -14,7 +14,11 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as PS
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
-from jax.lax import with_sharding_constraint as _with_sharding_constraint
+try:
+    from jax.experimental.pjit import with_sharding_constraint as _with_sharding_constraint
+except ImportError:
+    from jax.lax import with_sharding_constraint as _with_sharding_constraint
+    
 from jax.experimental.pjit import pjit
 from jax.interpreters import pxla
 import numpy as np
@@ -23,13 +27,38 @@ from absl import logging
 from einops import rearrange
 unfreeze = flax.core.unfreeze
 flatten_dict = flax.traverse_util.flatten_dict
-
+unflatten_dict = flax.traverse_util.unflatten_dict
+import tqdm
 from einops import reduce
 
 # print_attention_mask(max_pooling(attention_mask,64))
 # 
 # X = flatten_tree(,sep="/")["0/transformer/upcoder/layers/0/attention/attn_weights/0"][0][0][:,:-1] >0
 # print_attention_mask(max_pooling(X,16))
+
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+import tempfile
+import uuid
+
+def print_kwargs(**kwargs):
+    for k,v in kwargs.items():
+        print(f"{k}: {v}")
+
+def save_img(x):
+    x = jax.device_get(x).astype(np.float32)
+    # Set the size of the figure (in inches)
+    plt.figure(figsize=(20, 20))  # for a 10x8 inch figure
+    # Now display the image with imshow
+    dirname = tempfile.mkdtemp()
+    path_name = uuid.uuid4().hex
+    plt.imshow(x)
+    plt.show()
+    output_path = f"{dirname}/{path_name}.png"
+    plt.savefig(output_path)
+    print(output_path,flush=True)
 
 def print_attention_from_intermediates(intermediates,pat="attn_weights",has_null=True,factor=16):
     assert has_null
@@ -59,6 +88,7 @@ def add_process_dim(x):
         return x
     return rearrange(x, '(p l)  ... -> p l ... ', p=jax.process_count())
     # return x.reshape((num_processes, -1) + x.shape[1:])
+    
 def remove_process_dim(x):
     """Remove the process dimension from a tensor."""
     if x is None or not hasattr(x, 'shape'):
@@ -138,7 +168,7 @@ class JaxDistributedConfig(object):
         return config
 
     @classmethod
-    def initialize(cls, config):
+    def initialize(cls, config=None):
         config = cls.get_default_config(config)
         if config.initialize_jax_distributed:
             if config.local_device_ids is not None:
@@ -146,12 +176,12 @@ class JaxDistributedConfig(object):
             else:
                 local_device_ids = None
 
-            jax.distributed.initialize(
-                coordinator_address=config.coordinator_address,
-                num_processes=config.num_processes,
-                process_id=config.process_id,
-                local_device_ids=local_device_ids,
-            )
+        
+            # coordinator_address=config.coordinator_address,
+            # num_processes=config.num_processes,
+            # process_id=config.process_id,
+            # local_device_ids=local_device_ids,
+        
 
 
 class FlaxTemperatureLogitsWarper(FlaxLogitsWarper):
@@ -161,6 +191,7 @@ class FlaxTemperatureLogitsWarper(FlaxLogitsWarper):
 
     def __call__(self, input_ids, scores, cur_len):
         return scores / jnp.clip(self.temperature, a_min=1e-8)
+
 
 
 def make_shard_and_gather_fns(partition_specs, dtype_specs=None):
@@ -200,13 +231,20 @@ def make_shard_and_gather_fns(partition_specs, dtype_specs=None):
         return gather_fn
 
     if dtype_specs is None or dtype_specs in float_dtypes:
-        shard_fns = jax.tree_util.tree_map(make_shard_fn, partition_specs)
-        gather_fns = jax.tree_util.tree_map(make_gather_fn, partition_specs)
+        # par_spec = list(flatten_dict(partition_specs).items())
+        # shard_fns = unflatten_dict({key:make_shard_fn(value) for key,value in tqdm.tqdm(par_spec)})
+        # gather_fns = unflatten_dict({key:make_gather_fn(value) for key,value in tqdm.tqdm(par_spec)})
+        shard_fns = tree_map_w_tqdm(make_shard_fn, partition_specs)
+        gather_fns = tree_map_w_tqdm(make_gather_fn, partition_specs)
     else:
-        shard_fns = jax.tree_util.tree_map(
+        # par_spec = list(flatten_dict(partition_specs).items())
+        # dty_specs = flatten_dict(dtype_specs)
+        # shard_fns = unflatten_dict({key:make_shard_fn(value,dty_specs[key]) for key,value in tqdm.tqdm(par_spec)})
+        # gather_fns = unflatten_dict({key:make_gather_fn(value,dty_specs[key]) for key,value in tqdm.tqdm(par_spec)})
+        shard_fns = tree_map_w_tqdm(
             make_shard_fn, partition_specs, dtype_specs
         )
-        gather_fns = jax.tree_util.tree_map(
+        gather_fns = tree_map_w_tqdm(
             make_gather_fn, partition_specs, dtype_specs
         )
     return shard_fns, gather_fns
@@ -217,6 +255,50 @@ def set_random_seed(seed):
     random.seed(seed)
     init_rng(seed)
 
+
+from jax.sharding import PartitionSpec, NamedSharding, Mesh
+
+def _build_global_shape_and_sharding(
+        local_shape, global_mesh: Mesh
+):
+    sharding = NamedSharding(global_mesh, PartitionSpec(global_mesh.axis_names))
+
+    global_shape = (jax.process_count() * local_shape[0],) + local_shape[1:]
+
+    return global_shape, sharding
+
+
+def _form_global_array(path, array: np.ndarray, global_mesh: Mesh) -> jax.Array:
+    """ Put local sharded array into local devices
+    """
+    global_shape, sharding = _build_global_shape_and_sharding(np.shape(array), global_mesh)
+
+    try:
+        local_device_arrays = np.split(array, len(global_mesh.local_devices), axis=0)
+    except ValueError as array_split_error:
+        raise ValueError(
+            f"Unable to put to devices shape {array.shape} with "
+            f"local device count {len(global_mesh.local_devices)} "
+            f"at {jax.tree_util.keystr(path)}"
+        ) from array_split_error
+
+    local_device_buffers = jax.device_put(local_device_arrays, global_mesh.local_devices)
+    return jax.make_array_from_single_device_arrays(global_shape, sharding, local_device_buffers)
+
+def form_global_input(local_data, global_mesh: Mesh) -> jax.Array:
+    return jax.tree_util.tree_map_with_path(partial(_form_global_array, global_mesh = global_mesh), local_data)
+
+
+def to_global(batch, mesh,):
+    batch = form_global_input(batch, mesh)
+
+from flax.serialization import (
+from_bytes, to_bytes, to_state_dict, from_state_dict
+)
+from flax.traverse_util import flatten_dict, unflatten_dict, empty_node
+
+def flatten_state(state):
+    return flatten_dict(to_state_dict(state))
 
 def get_jax_mesh(axis_dims, names):
     if axis_dims.startswith('!'):
@@ -243,8 +325,8 @@ def get_jax_mesh(axis_dims, names):
     if mesh_axis_splitting:
         physical_mesh = np.array(jax.devices()).reshape(mesh_shape)
     else:
+        # physical_mesh = mesh_utils.create_device_mesh(mesh_shape)
         physical_mesh = mesh_utils.create_device_mesh(mesh_shape)
-        # physical_mesh = mesh_utils.create_device_mesh(mesh_shape,contiguous_submeshes=True)
     return Mesh(physical_mesh, dim_names)
 
 
@@ -441,6 +523,55 @@ def named_tree_map(f, tree, *rest, is_leaf=None, sep=None):
     )
 
 
+
+def reshape_for_vmap(x):
+    if hasattr(x,"shape"):
+        if  len(x.shape) == 0:
+            return x.reshape([1])
+        return x.reshape((x.shape[0], 1)+ tuple(x.shape[1:]))
+    else:
+        return x
+def unshard(x):
+    return x.reshape((-1,)+ tuple(x.shape[2:]))
+
+
+def tree_map_w_tqdm(f, tree, *rest, is_leaf = None):
+  """Maps a multi-input function over pytree args to produce a new pytree.
+
+  Args:
+    f: function that takes ``1 + len(rest)`` arguments, to be applied at the
+      corresponding leaves of the pytrees.
+    tree: a pytree to be mapped over, with each leaf providing the first
+      positional argument to ``f``.
+    rest: a tuple of pytrees, each of which has the same structure as ``tree``
+      or has ``tree`` as a prefix.
+    is_leaf: an optionally specified function that will be called at each
+      flattening step. It should return a boolean, which indicates whether
+      the flattening should traverse the current object, or if it should be
+      stopped immediately, with the whole subtree being treated as a leaf.
+
+  Returns:
+    A new pytree with the same structure as ``tree`` but with the value at each
+    leaf given by ``f(x, *xs)`` where ``x`` is the value at the corresponding
+    leaf in ``tree`` and ``xs`` is the tuple of values at corresponding nodes in
+    ``rest``.
+
+  Examples:
+
+    >>> import jax.tree_util
+    >>> jax.tree_util.tree_map(lambda x: x + 1, {"x": 7, "y": 42})
+    {'x': 8, 'y': 43}
+
+    If multiple inputs are passed, the structure of the tree is taken from the
+    first input; subsequent inputs need only have ``tree`` as a prefix:
+
+    >>> jax.tree_util.tree_map(lambda x, y: [x] + y, [5, 6], [[7, 9], [1, 2]])
+    [[5, 7, 9], [6, 1, 2]]
+  """
+  leaves, treedef = jax.tree_util.tree_flatten(tree, is_leaf)
+  all_leaves = [tqdm.tqdm(leaves)] + [treedef.flatten_up_to(r) for r in rest]
+  return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+
 def match_partition_rules(rules, params):
     """ Returns a pytree of PartitionSpec according to rules. Supports handling
         Flax TrainState and Optax optimizer state.
@@ -476,3 +607,15 @@ def tree_apply(fns, tree):
     """ Apply a pytree of functions to the pytree. """
     return jax.tree_util.tree_map(lambda fn, x: fn(x), fns, tree)
 
+
+
+@jax.vmap
+def vmap_slice(array, indices):
+  """Convenience function for indexing that differs along first dimension ."""
+  return array[indices]
+
+
+@jax.vmap
+def vmap_index_add(array, indices, values):
+  """Convenience function for index add that differs along first dimension."""
+  return array.at[indices].add(values)
