@@ -631,7 +631,7 @@ class FlaxGPTNeoXLinearScalingRotaryEmbedding(FlaxGPTNeoXRotaryEmbedding):
         return cos.astype(jnp.float32), sin.astype(jnp.float32)
 
 
-class FlaxGPTNeoXDynamicNTKScalingRotaryEmbedding (FlaxGPTNeoXRotaryEmbedding):
+class FlaxGPTNeoXDynamicNTKScalingRotaryEmbedding(FlaxGPTNeoXRotaryEmbedding):
     """FlaxGPTNeoXRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
 
     scaling_factor: float = 1.0
@@ -2612,7 +2612,7 @@ class FlaxGPTNeoXForCausalLM(FlaxGPTNeoXPreTrainedModel):
             "position_ids": position_ids,
             "chunk_index":chunk_index,
             **kwargs
-        }            
+        }
 
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):

@@ -13,33 +13,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ PyTorch GPTNeoX model."""
+import warnings
+from distutils import dist
+from typing import Optional, Tuple, Union, Dict, Any, List
 
-from typing import Optional, Tuple, Union
-
+import einops
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
-from transformers import AutoTokenizer
-
-from transformers.activations import ACT2FN
+from transformers import AutoTokenizer, LogitsProcessorList, StoppingCriteriaList
+from transformers.configuration_utils import PretrainedConfig
 from transformers.file_utils import (
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     replace_return_docstrings,
 )
+from transformers.generation import GenerateEncoderDecoderOutput, GenerateDecoderOnlyOutput, validate_stopping_criteria
 from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
     CausalLMOutputWithPast,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutputWithPast,
-    TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import is_flash_attn_2_available, is_flash_attn_greater_or_equal_2_10, logging
-from transformers.configuration_utils import PretrainedConfig
+from transformers.utils import logging
+
+from EasyLM.models.neox.attention_torch import my_dot_product_attention_weights
+from EasyLM.models.neox.gate_torch import GriffinGate
+from EasyLM.models.rpt.rpt_torch_utils import EncodedNeighbors, new_lookup_neighbors, GPTNeoXRetrieverNeighborOutput, \
+    GPTNeoXRetrieverEncodedOutput, GPTNeoXLMOutput
+from EasyLM.torch_utils import make_causal_mask, assign_slice, combine_masks
 
 
 class GPTNeoXConfig(PretrainedConfig):
@@ -275,6 +278,7 @@ class GPTNeoXConfig(PretrainedConfig):
             )
         if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
             raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
+
     @classmethod
     def get_tokenizer(cls, **kwargs):
         tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b",
@@ -282,11 +286,6 @@ class GPTNeoXConfig(PretrainedConfig):
                                                   mask_token='<|endoftext|>',
                                                   **kwargs)
         return tokenizer
-
-
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 
 logger = logging.get_logger(__name__)
@@ -338,9 +337,10 @@ class GPTNeoXPreTrainedModel(PreTrainedModel):
 
 
 class GPTNeoXAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, dtype):
         super().__init__()
         self.config = config
+        self.dtype = dtype
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         if self.hidden_size % self.num_attention_heads != 0:
@@ -349,18 +349,20 @@ class GPTNeoXAttention(nn.Module):
             )
         self.head_size = self.hidden_size // self.num_attention_heads
         self.rotary_ndims = int(self.head_size * config.rotary_pct)
-        self._init_bias(config.max_position_embeddings)
 
-        self.register_buffer("masked_bias", torch.tensor(-1e9), persistent=False)
         self._init_rope()
 
-        self.norm_factor = self.head_size**-0.5
+        self.norm_factor = self.head_size ** -0.5
         self.query_key_value = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=config.attention_bias)
         self.dense = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
         self.is_causal = True
-        self.causal_mask = make_causal_mask(jnp.ones((1, max_seq_length), dtype="bool"), dtype="bool")
+        self.causal_mask = None
 
+        # TODO: Verify size
+        self.register_buffer('cached_key', torch.zeros((1, 1, self.config.max_positions, self.config.max_positions)))
+        self.register_buffer('cached_value', torch.zeros((1, 1, self.config.max_positions, self.config.max_positions)))
+        self.register_buffer('cache_index', torch.tensor(0))
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -387,23 +389,49 @@ class GPTNeoXAttention(nn.Module):
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
+    def _concatenate_to_cache(self, key, value, query, attention_mask):
+        cached_key = self.get_buffer("cached_key")
+        cached_value = self.variable("cached_value")
+        cache_index = self.variable("cached_index")
+
+        *batch_dims, max_length, num_heads, depth_per_head = cached_key.shape
+        cur_index = cache_index.value
+        indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
+
+        key = assign_slice(cached_key, key, indices)
+        value = assign_slice(cached_value, value, indices)
+
+        self.register_buffer('cached_key', key)
+        self.register_buffer('cached_value', value)
+        num_updated_cache_vectors = query.shape[1]
+        self.register_buffer('cache_index', cache_index.value + num_updated_cache_vectors)
+
+        pad_mask = torch.broadcast_to(
+            torch.arange(max_length) < cur_index + num_updated_cache_vectors,
+            tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+        )
+
+        attention_mask = combine_masks(pad_mask, attention_mask)
+
+        return key, value, attention_mask
+
     def forward(
-        self,
-        hidden_states: torch.FloatTensor,
-        attention_mask: torch.FloatTensor,
-        position_ids: torch.LongTensor,
-        head_mask: Optional[torch.FloatTensor] = None,
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-        padding_mask: Optional[torch.Tensor] = None,
+            self,
+            hidden_states: torch.FloatTensor,
+            attention_mask: torch.FloatTensor,
+            position_ids: torch.LongTensor,
+            head_mask: Optional[torch.FloatTensor] = None,
+            layer_past: Optional[Tuple[torch.Tensor]] = None,
+            use_cache: Optional[bool] = False,
+            output_attentions: Optional[bool] = False,
+            padding_mask: Optional[torch.Tensor] = None,
     ):
         has_layer_past = layer_past is not None
 
         # Compute QKV
         # Attention heads [batch, seq_len, hidden_size]
         #   --> [batch, seq_len, (np * 3 * head_size)]
-        #qkv = self.query_key_value(hidden_states)
+        # qkv = self.query_key_value(hidden_states)
 
         fused_qkv = self.query_key_value(hidden_states)
         batch, seq_len, _ = fused_qkv.shape
@@ -413,10 +441,10 @@ class GPTNeoXAttention(nn.Module):
         cos, sin = self.rotary_emb(seq_len)
         if self.rotary_ndims is not None:
             k_rot = key[..., : self.rotary_ndims]
-            k_pass = key[..., self.rotary_ndims :]
+            k_pass = key[..., self.rotary_ndims:]
 
             q_rot = query[..., : self.rotary_ndims]
-            q_pass = query[..., self.rotary_ndims :]
+            q_pass = query[..., self.rotary_ndims:]
 
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin, position_ids)
 
@@ -429,7 +457,28 @@ class GPTNeoXAttention(nn.Module):
 
         query_length, key_length = query.shape[1], key.shape[1]
 
-        if self.register_buffer()
+        if self.causal_mask is not None:
+            mask_shift = self.variables["cache"]["cache_index"]
+            max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
+
+            causal_mask = assign_slice(
+                self.causal_mask, (1, 1, query_length, max_decoder_length), (0, 0, mask_shift, 0)
+            )
+        else:
+            if self.config.rope_scaling is None:
+                max_seq_length = self.config.max_position_embeddings
+            else:
+                max_seq_length = int(self.config.max_position_embeddings * self.config.rope_scaling["factor"])
+
+            self.causal_mask = make_causal_mask(torch.ones((1, max_seq_length), dtype=torch.bool), dtype=torch.bool)
+            causal_mask = self.causal_mask[:, :, :query_length, :key_length]
+
+        causal_mask = torch.broadcast_to(causal_mask, (batch,) + causal_mask.shape[1:])
+        # TODO: Using views instead?
+        attention_mask = torch.broadcast_to(attention_mask.unsqueeze(1).unsqueeze(1), causal_mask.shape)
+        attention_mask = combine_masks(attention_mask, causal_mask)
+
+        key, value, attention_mask = self._concatenate_to_cache(key, value, query, attention_mask)
 
         # Cache QKV values
         if has_layer_past:
@@ -439,8 +488,23 @@ class GPTNeoXAttention(nn.Module):
             value = torch.cat((past_value, value), dim=-2)
         present = (key, value) if use_cache else None
 
+        # transform boolean mask into float mask
+        attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
+        attention_bias[attention_mask > 0] = 0.0
+
+        # TODO: Add deterministic
         # Compute attention
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+        attn_weights = my_dot_product_attention_weights(
+            query,
+            key,
+            bias=attention_bias,
+            dropout_rate=self.config.attention_dropout,
+            dtype=torch.float32,
+            apply_tanh=self.config.tanh_causal_att,
+        )
+
+        attn_weights = attn_weights.type(self.dtype)
+        attn_output = torch.einsum("bhqk,bkhd->bqhd", attn_weights, value.astype(self.dtype))
 
         # Reshape outputs
         attn_output = self._merge_heads(attn_output, self.num_attention_heads, self.head_size)
@@ -477,283 +541,329 @@ class GPTNeoXAttention(nn.Module):
         # -> [bs, seq_len, hidden_size]
         return tensor
 
-    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        # q, k, v: [bs, num_attention_heads, seq_len, attn_head_size]
-        # compute causal mask from causal mask buffer
-        batch_size, num_attention_heads, query_length, attn_head_size = query.size()
-        key_length = key.size(-2)
-
-        # dynamically increase the causal mask with the key length, if needed.
-        if key_length > self.bias.shape[-1]:
-            self._init_bias(key_length, device=key.device)
-        causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
-
-        query = query.view(batch_size * num_attention_heads, query_length, attn_head_size)
-        key = key.view(batch_size * num_attention_heads, key_length, attn_head_size)
-        attn_scores = torch.zeros(
-            batch_size * num_attention_heads,
-            query_length,
-            key_length,
-            dtype=query.dtype,
-            device=key.device,
-        )
-        attn_scores = torch.baddbmm(
-            attn_scores,
-            query,
-            key.transpose(1, 2),
-            beta=1.0,
-            alpha=self.norm_factor,
-        )
-        attn_scores = attn_scores.view(batch_size, num_attention_heads, query_length, key_length)
-
-        mask_value = torch.finfo(attn_scores.dtype).min
-        # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-        # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-        mask_value = torch.tensor(mask_value, dtype=attn_scores.dtype).to(attn_scores.device)
-        attn_scores = torch.where(causal_mask, attn_scores, mask_value)
-
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_scores = attn_scores + attention_mask
-
-        attn_weights = nn.functional.softmax(attn_scores, dim=-1)
-        attn_weights = attn_weights.to(value.dtype)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            attn_weights = attn_weights * head_mask
-
-        attn_weights = self.attention_dropout(attn_weights)
-
-        attn_output = torch.matmul(attn_weights, value)
-        return attn_output, attn_weights
-
-
-class GPTNeoXFlashAttention2(GPTNeoXAttention):
-    """
-    GPTNeoX flash attention module. This module inherits from `GPTNeoXAttention` as the weights of the module stays
-    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
-    flash attention and deal with padding tokens in case the input contains any of them.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
-        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
-        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
-
-    def forward(
-        self,
-        hidden_states: torch.FloatTensor,
-        attention_mask: torch.FloatTensor,
-        position_ids: torch.LongTensor,
-        head_mask: Optional[torch.FloatTensor] = None,
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-    ):
-        has_layer_past = layer_past is not None
-
-        # Compute QKV
-        # Attention heads [batch, seq_len, hidden_size]
-        #   --> [batch, seq_len, (np * 3 * head_size)]
-        qkv = self.query_key_value(hidden_states)
-
-        # [batch, seq_len, (num_heads * 3 * head_size)]
-        #   --> [batch, seq_len, num_heads, 3 * head_size]
-        new_qkv_shape = qkv.size()[:-1] + (self.num_attention_heads, 3 * self.head_size)
-        qkv = qkv.view(*new_qkv_shape)
-
-        # [batch, seq_len, num_attention_heads, 3 * head_size] --> 3 [batch, num_attention_heads, seq_len, head_size]
-        query = qkv[..., : self.head_size].permute(0, 2, 1, 3)
-        key = qkv[..., self.head_size : 2 * self.head_size].permute(0, 2, 1, 3)
-        value = qkv[..., 2 * self.head_size :].permute(0, 2, 1, 3)
-
-        query_length = query.shape[-2]
-
-        # Compute rotary embeddings on rotary_ndims
-        query_rot = query[..., : self.rotary_ndims]
-        query_pass = query[..., self.rotary_ndims :]
-        key_rot = key[..., : self.rotary_ndims]
-        key_pass = key[..., self.rotary_ndims :]
-
-        # Compute token offset for rotary embeddings (when decoding)
-        seq_len = key.shape[-2]
-        if has_layer_past:
-            seq_len += layer_past[0].shape[-2]
-        cos, sin = self.rotary_emb(value, seq_len=seq_len)
-        query, key = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, position_ids)
-        query = torch.cat((query, query_pass), dim=-1)
-        key = torch.cat((key, key_pass), dim=-1)
-
-        # Cache QKV values
-        if has_layer_past:
-            past_key = layer_past[0]
-            past_value = layer_past[1]
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
-        present = (key, value) if use_cache else None
-
-        # GPT-neo-X casts query and key in fp32 to apply rotary embedding in full precision
-        target_dtype = value.dtype
-        if query.dtype != target_dtype:
-            query = query.to(target_dtype)
-        if key.dtype != target_dtype:
-            key = key.to(target_dtype)
-
-        # Permute to get the expected shape for Flash Attention
-        query = query.permute(0, 2, 1, 3)
-        key = key.permute(0, 2, 1, 3)
-        value = value.permute(0, 2, 1, 3)
-
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently casted in float32. Hence, we need
-        # cast them back in float16 / bfloat16 just to be sure everything works as expected.
-        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-        input_dtype = query.dtype
-        if input_dtype == torch.float32:
-            if torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
-            # Handle the case where the model is quantized
-            elif hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            else:
-                target_dtype = self.query_key_value.weight.dtype
-
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
-
-            query = query.to(target_dtype)
-            key = key.to(target_dtype)
-            value = value.to(target_dtype)
-
-        attention_dropout = self.config.attention_dropout if self.training else 0.0
-
-        # Compute attention
-        attn_weights = self._flash_attention_forward(
-            query, key, value, attention_mask, query_length, dropout=attention_dropout, softmax_scale=self.norm_factor
-        )
-
-        # Reshape outputs
-        attn_output = attn_weights.reshape(
-            attn_weights.shape[0], attn_weights.shape[1], self.num_attention_heads * self.head_size
-        )
-        attn_output = self.dense(attn_output)
-
-        outputs = (attn_output, present)
-        if output_attentions:
-            outputs += (attn_weights,)
-
-        return outputs
-
-    # Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2._flash_attention_forward
-    def _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
-    ):
-        """
-        Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
-        first unpad the input, then computes the attention scores and pad the final attention scores.
-
-        Args:
-            query_states (`torch.Tensor`):
-                Input query states to be passed to Flash Attention API
-            key_states (`torch.Tensor`):
-                Input key states to be passed to Flash Attention API
-            value_states (`torch.Tensor`):
-                Input value states to be passed to Flash Attention API
-            attention_mask (`torch.Tensor`):
-                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
-                position of padding tokens and 1 for the position of non-padding tokens.
-            dropout (`float`):
-                Attention dropout
-            softmax_scale (`float`, *optional*):
-                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
-        """
-        if not self._flash_attn_uses_top_left_mask:
-            causal = self.is_causal
-        else:
-            # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in LlamaFlashAttention2 __init__.
-            causal = self.is_causal and query_length != 1
-
-        # Contains at least one padding token in the sequence
-        if attention_mask is not None:
-            batch_size = query_states.shape[0]
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
-            )
-
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-
-            attn_output_unpad = flash_attn_varlen_func(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_in_batch_q,
-                max_seqlen_k=max_seqlen_in_batch_k,
-                dropout_p=dropout,
-                softmax_scale=softmax_scale,
-                causal=causal,
-            )
-
-            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
-        else:
-            attn_output = flash_attn_func(
-                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
-            )
-
-        return attn_output
-
-    # Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2._upad_input with num_heads->num_attention_heads
-    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
-        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
-
-        key_layer = index_first_axis(
-            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-        )
-        value_layer = index_first_axis(
-            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
-        )
-        if query_length == kv_seq_len:
-            query_layer = index_first_axis(
-                query_layer.reshape(batch_size * kv_seq_len, self.num_attention_heads, head_dim), indices_k
-            )
-            cu_seqlens_q = cu_seqlens_k
-            max_seqlen_in_batch_q = max_seqlen_in_batch_k
-            indices_q = indices_k
-        elif query_length == 1:
-            max_seqlen_in_batch_q = 1
-            cu_seqlens_q = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=query_layer.device
-            )  # There is a memcpy here, that is very bad.
-            indices_q = cu_seqlens_q[:-1]
-            query_layer = query_layer.squeeze(1)
-        else:
-            # The -q_len: slice assumes left padding.
-            attention_mask = attention_mask[:, -query_length:]
-            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
-
-        return (
-            query_layer,
-            key_layer,
-            value_layer,
-            indices_q,
-            (cu_seqlens_q, cu_seqlens_k),
-            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
-        )
-
 
 def attention_mask_func(attention_scores, ltor_mask):
     attention_scores.masked_fill_(~ltor_mask, torch.finfo(attention_scores.dtype).min)
     return attention_scores
+
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: torch.dtype = torch.float32,
+                         device=None) -> torch.Tensor:
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].type(dtype) / dim))
+    t = torch.arange(end)
+    freqs = torch.outer(t, freqs).type(dtype)
+    sin, cos = torch.sin(freqs), torch.cos(freqs)
+    freqs_cis = cos + 1j * sin
+    return torch.asarray(freqs_cis).to(device)
+
+
+def apply_rotary_emb_(
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        dtype: torch.dtype = torch.float32,
+        freqs_cis_k: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    reshape_xq = xq.type(torch.float32).reshape(*xq.shape[:-1], -1, 2)
+    reshape_xk = xk.type(torch.float32).reshape(*xk.shape[:-1], -1, 2)
+
+    xq_ = torch.complex(reshape_xq[..., 0], reshape_xq[..., 1])
+    xk_ = torch.complex(reshape_xk[..., 0], reshape_xk[..., 1])
+
+    freqs_cis = torch.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
+
+    xq_out = xq_ * freqs_cis
+    xq_out = torch.stack((torch.real(xq_out), torch.imag(xq_out)), dim=-1).reshape(*xq_out.shape[:-1], -1)
+    if freqs_cis_k is None:
+        xk_out = xk_ * freqs_cis
+        xk_out = torch.stack((torch.real(xk_out), torch.imag(xk_out)), dim=-1).reshape(*xk_out.shape[:-1], -1)
+    else:
+        freqs_cis_k = torch.reshape(freqs_cis_k, (*freqs_cis_k.shape[:2], 1, *freqs_cis_k.shape[2:]))
+        xk_out = xk_ * freqs_cis_k
+        xk_out = torch.stack((torch.real(xk_out), torch.imag(xk_out)), dim=-1).reshape(*xk_out.shape[:-1], -1)
+
+    return xq_out.type(dtype), xk_out.type(dtype)
+
+
+def apply_rotary_emb(
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        dtype: torch.dtype = torch.float32,
+        freqs_cis_k: torch.Tensor = None,
+        rot_dim: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if rot_dim is not None and rot_dim > 0:
+
+        # Separate the tensors based on the rotation dimensions
+        xq_rot, xq_pass = xq[..., :rot_dim], xq[..., rot_dim:]
+        xk_rot, xk_pass = xk[..., :rot_dim], xk[..., rot_dim:]
+
+        # freqs_q_rot = freqs_q[..., :rot_dim]
+        # freqs_k_rot = freqs_k[..., :rot_dim] if freqs_k is not None else None
+
+        # Apply the function on the parts that need rotation
+        print(freqs_cis.shape, xq_rot.shape, xk_rot.shape)
+        xq_rot, xk_rot = apply_rotary_emb_(xq_rot, xk_rot, freqs_cis, dtype=dtype, freqs_cis_k=freqs_cis_k)
+
+        # Concatenate the rotated and non-rotated parts
+        xq_out = torch.concatenate((xq_rot, xq_pass), dim=-1)
+        xk_out = torch.concatenate((xk_rot, xk_pass), dim=-1)
+    else:
+        xq_out, xk_out = apply_rotary_emb_(xq, xk, freqs_cis, dtype=dtype, freqs_cis_k=freqs_cis_k)
+
+    return xq_out, xk_out
+
+
+class GPTNeoXCrossAttention(nn.Module):
+
+    def __init__(self, config, dtype):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.qk_layernorm = config.qk_layernorm
+        self.head_dim = self.embed_dim // self.num_heads
+
+        self.wq = nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
+        )
+
+        self.wk = nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
+        )
+
+        self.wv = nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
+        )
+
+        self.wo = nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
+        )
+
+        self.freqs_cis = precompute_freqs_cis(
+            self.head_dim,
+            config.max_position_embeddings * 2,
+        )
+        self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
+        self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
+        if self.qk_layernorm:
+            self.q_layernorm = nn.LayerNorm(eps=self.config.layer_norm_eps, dtype=self.dtype)
+            self.k_layernorm = nn.LayerNorm(eps=self.config.layer_norm_eps, dtype=self.dtype)
+
+    def _split_heads(self, hidden_states):
+        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
+
+    def _merge_heads(self, hidden_states):
+        return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            key_value_states: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
+            kv_position_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            retriever_scores: Optional[torch.Tensor] = None,
+            output_attentions: bool = False,
+            deterministic: bool = True,
+    ) -> Tuple[torch.Tensor]:
+
+        is_cross_attention = key_value_states is not None
+
+        xq = self.wq(hidden_states)
+        xq = self._split_heads(xq).astype(self.dtype)
+        xq = self.q_layernorm(xq) if self.qk_layernorm else xq
+
+        if not is_cross_attention:
+            key_value_states = hidden_states
+
+        xk = self.wk(key_value_states)
+        xk = self._split_heads(xk).astype(self.dtype)
+        xk = self.k_layernorm(xk) if self.qk_layernorm else xk
+
+        xv = self.wv(key_value_states)
+        xv = self._split_heads(xv).astype(self.dtype)
+
+        null_k = self.k_layernorm(self.null_k) if self.qk_layernorm else self.null_k
+
+        query_length, key_length = xq.shape[1], xk.shape[1]
+        batch_size = hidden_states.shape[0]
+        print(f"{xq.shape=}, {xk.shape=}, {self.has_variable('cache', 'cached_key')=}")
+
+        if position_ids is None:
+            position_ids = torch.arange(query_length, dtype=torch.int32)
+            position_ids = torch.broadcast_to(position_ids[None, :], (batch_size, query_length))
+
+        freqs_cis = self.freqs_cis[position_ids]
+        if not is_cross_attention:
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype, rot_dim=self.config.rot_dim)
+        else:
+            if kv_position_ids is None:
+                kv_position_ids = torch.arange(key_length, dtype=torch.int32)
+                kv_position_ids = torch.broadcast_to(kv_position_ids[None, :], (batch_size, key_length))
+            freqs_cis_k = self.freqs_cis[kv_position_ids]
+
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, freqs_cis_k=freqs_cis_k, dtype=self.dtype,
+                                      rot_dim=self.config.rot_dim)
+
+        null_k = torch.broadcast_to(null_k, (batch_size, 1, self.num_heads, self.head_dim)).type(self.dtype)
+        xk = torch.concatenate((xk, null_k), dim=-3)
+        null_v = torch.broadcast_to(self.null_v, (batch_size, 1, self.num_heads, self.head_dim)).type(self.dtype)
+        xv = torch.concatenate((xv, null_v), dim=-3)
+
+        if attention_mask is not None:
+            null_mask = torch.ones((attention_mask.shape[0], 1), dtype=torch.float32)
+            attention_mask = torch.concatenate((attention_mask, null_mask), dim=-1)
+            attention_mask = attention_mask.unsqueeze(-2).unsqueeze(-2)
+
+            if retriever_scores is None:
+                attention_bias = torch.full(attention_mask.shape, 0.0).type(self.dtype)
+            else:
+                null_ret_score = torch.zeros((retriever_scores.shape[0], 1), dtype=torch.float32)
+                attention_bias = torch.concatenate((retriever_scores, null_ret_score), dim=-1)
+                attention_bias = attention_bias.unsqueeze(-2).unsqueeze(-2)
+
+            attention_bias[attention_mask <= 0] = torch.finfo(self.dtype).min
+
+            if xq.shape[0] != attention_bias.shape[0]:
+                attention_bias = attention_bias[:batch_size, ...]
+        else:
+            attention_bias = None
+
+        attn_weights = my_dot_product_attention_weights(
+            xq,
+            xk,
+            bias=attention_bias,
+            dropout_rate=self.config.attn_pdrop,
+            deterministic=deterministic,
+            dtype=self.dtype,
+            apply_tanh=self.config.tanh_xatt,
+        )
+
+        attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv.type(self.dtype))
+
+        attn_output = self._merge_heads(attn_output)
+
+        attn_output = self.wo(attn_output).type(self.dtype)
+        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+        return outputs
+
+
+class GPTNeoXChunkedCrossAttention(nn.Module):
+    def __init__(self, config, dtype):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.chunk_size = self.config.chunk_size
+        self.num_neighbors = self.config.num_neighbors
+        self.cross_attention = GPTNeoXCrossAttention(self.config, dtype=self.dtype)
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            neighbor_hidden_states,
+            neighbor_mask,
+            nei_position_ids,
+            att_scores,
+            position_ids: Optional[torch.Tensor] = None,
+            output_attentions: bool = False,
+            deterministic: bool = True,
+            chunk_size: Optional[int] = None,
+            n_chunks_per_window: Optional[int] = None,
+    ):
+        if not self.config.ret_score_in_cca:
+            att_scores = None
+
+        func = self.new_call
+        func = torch.vmap(func,
+                          in_dims=(0, 0, 0, 0, 0 if att_scores is not None else None,
+                                   0 if position_ids is not None else None, None, None, None, None),
+                          out_dims=0,
+                          )
+        return func(hidden_states, neighbor_hidden_states, neighbor_mask, nei_position_ids, att_scores,
+                    position_ids, output_attentions, deterministic, chunk_size, n_chunks_per_window)
+
+    def new_call(
+            self,
+            hidden_states: torch.Tensor,
+            neighbor_hidden_states,
+            neighbor_mask,
+            nei_position_ids,
+            att_scores,
+            position_ids: Optional[torch.Tensor] = None,
+            output_attentions: bool = False,
+            deterministic: bool = True,
+            chunk_size: Optional[int] = None,
+            n_chunks_per_window: Optional[int] = None,
+    ):
+
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        if chunk_size is None:
+            chunk_size = self.chunk_size
+        # chunk_size = self.chunk_size
+        causal_padding = chunk_size - 1
+        is_generating = position_ids is not None
+        num_document_chunks, num_neighbors, ret_size = neighbor_mask.shape
+        neighbor_mask = einops.rearrange(neighbor_mask, 'b k r -> b (k r)')
+        nei_position_ids = einops.rearrange(nei_position_ids, 'b k r -> b (k r)')
+        neighbor_hidden_states = einops.rearrange(neighbor_hidden_states, 'b k r d-> b (k r) d')
+        if att_scores is not None:
+            att_scores = einops.rearrange(att_scores, 'b k r -> b (k r)')
+
+        # TODO: remove this
+        nei_position_ids = torch.clip(nei_position_ids, min=0, max=2 * self.config.chunk_size - 1)
+
+        # -> (-1, n_chunks_per_window, num_neighbors, 2*chunk_size, hidden_dim)
+        if not is_generating:
+            if n_chunks_per_window is None:
+                # n_chunks_per_window = seq_len//chunk_size
+                n_chunks_per_window = num_document_chunks // hidden_states.shape[0]
+            # ->  (-1 ,chunk_size, hidden_dim)
+            hidden_states = hidden_states.reshape([-1, n_chunks_per_window * chunk_size, hidden_dim])
+            hidden_states = torch.pad(hidden_states[:, causal_padding:, :], ((0, 0), (0, causal_padding), (0, 0)),
+                                      'constant')
+            hidden_states = hidden_states.reshape([-1, chunk_size, hidden_dim])
+
+            position_ids = torch.arange(chunk_size) + chunk_size - 1
+            position_ids = torch.broadcast_to(position_ids, hidden_states.shape[:2])
+        else:
+            hidden_states = hidden_states.reshape([1, 1, hidden_dim])
+
+        # cross attention
+        output = self.cross_attention(
+            hidden_states=hidden_states,
+            key_value_states=neighbor_hidden_states,
+            position_ids=position_ids,
+            kv_position_ids=nei_position_ids,
+            attention_mask=neighbor_mask,
+            retriever_scores=att_scores,
+            output_attentions=output_attentions,
+            deterministic=deterministic,
+        )
+
+        # reshape back to original sequence
+        cross_attention_out = output[0]
+        if not is_generating:
+            cross_attention_out = cross_attention_out.reshape([-1, n_chunks_per_window * chunk_size, hidden_dim])
+            # # pad back to original, with 0s at the beginning (which will be added to the residual and be fine)
+            cross_attention_out = torch.pad(cross_attention_out, ((0, 0), (causal_padding, 0), (0, 0)), 'constant')[:,
+                                  :-causal_padding]
+        cross_attention_out = cross_attention_out.reshape([batch_size, seq_len, hidden_dim])
+        return (cross_attention_out,) + output[1:]
 
 
 class GPTNeoXRotaryEmbedding(nn.Module):
@@ -828,7 +938,7 @@ class GPTNeoXDynamicNTKScalingRotaryEmbedding(GPTNeoXRotaryEmbedding):
 
         if seq_len > self.max_position_embeddings:
             base = self.base * (
-                (self.scaling_factor * seq_len / self.max_position_embeddings) - (self.scaling_factor - 1)
+                    (self.scaling_factor * seq_len / self.max_position_embeddings) - (self.scaling_factor - 1)
             ) ** (self.dim / (self.dim - 2))
             inv_freq = 1.0 / (base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
             self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -845,7 +955,7 @@ class GPTNeoXDynamicNTKScalingRotaryEmbedding(GPTNeoXRotaryEmbedding):
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -875,11 +985,20 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 
 class GPTNeoXMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, dtype=torch.float32, intermediate_size=None):
         super().__init__()
-        self.dense_h_to_4h = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.dense_4h_to_h = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.act = ACT2FN[config.hidden_act]
+        self.dtype = dtype
+        self.intermediate_size = intermediate_size
+
+        embed_dim = self.config.hidden_size
+        if self.intermediate_size is None:
+            intermediate_size = self.config.intermediate_size
+        else:
+            intermediate_size = self.intermediate_size
+
+        self.dense_h_to_4h = nn.Linear(embed_dim, intermediate_size)
+        self.dense_4h_to_h = nn.Linear(intermediate_size, embed_dim)
+        self.act = GPTNeoXAttention(config)
 
     def forward(self, hidden_states):
         hidden_states = self.dense_h_to_4h(hidden_states)
@@ -888,67 +1007,249 @@ class GPTNeoXMLP(nn.Module):
         return hidden_states
 
 
-GPT_NEOX_ATTENTION_CLASSES = {
-    "eager": GPTNeoXAttention,
-    "flash_attention_2": GPTNeoXFlashAttention2,
-}
+class GPTNeoXQueryAugmentorLayer(nn.Module):
 
-
-class GPTNeoXLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, dtype):
         super().__init__()
-        self.use_parallel_residual = config.use_parallel_residual
-        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.post_attention_dropout = nn.Dropout(config.hidden_dropout)
-        self.post_mlp_dropout = nn.Dropout(config.hidden_dropout)
-        self.attention = GPT_NEOX_ATTENTION_CLASSES[config._attn_implementation](config)
-        self.mlp = GPTNeoXMLP(config)
+        self.config = config
+        self.dtype = dtype
+
+        kwargs = dict(width=self.config.hidden_size, dtype=self.dtype, param_dtype=self.param_dtype,
+                      num_blocks=self.config.gate_num_blocks, after_refactor=self.config.gate_refactor)
+        self.nei_gate = GriffinGate(**kwargs, a_init=self.config.a_init_nei) if self.config.apply_gating else None
+        self.nei_to_query_att = GPTNeoXCrossAttention(self.config, dtype=self.dtype)
+        self.nei_att_ln = nn.LayerNorm(eps=self.config.layer_norm_eps, dtype=self.dtype)
+        self.nei_lowrank_mlp = GPTNeoXMLP(self.config, dtype=self.dtype, intermediate_size=self.config.query_aug_dim)
+        self.nei_lowrank_mlp_ln = nn.LayerNorm(eps=self.config.layer_norm_eps, dtype=self.dtype)
+
+        self.query_att_ln = nn.LayerNorm(eps=self.config.layer_norm_eps, dtype=self.dtype)
+        if self.config.apply_query_to_nei_att:
+            self.query_to_nei_att = GPTNeoXCrossAttention(self.config, dtype=self.dtype)
+            self.query_lowrank_mlp = GPTNeoXMLP(self.config, dtype=self.dtype,
+                                                intermediate_size=self.config.query_aug_dim)
+            self.query_lowrank_mlp_ln = nn.LayerNorm(eps=self.config.layer_norm_eps, dtype=self.dtype)
+            self.query_gate = GriffinGate(**kwargs,
+                                          a_init=self.config.a_init_query) if self.config.apply_gating else None
+        else:
+            self.query_to_nei_att = None
+            self.query_lowrank_mlp = None
+            self.query_lowrank_mlp_ln = None
+
+    def forward(self,
+                query,
+                query_attention_mask,
+                nei,
+                nei_attention_mask,
+                nei_position_ids=None,
+                chunk_size=None,
+                is_last=False,
+                ):
+        if chunk_size is None:
+            chunk_size = self.config.chunk_size
+
+        original_query, original_nei = query, nei
+        query, nei = self.query_att_ln(query), self.nei_att_ln(nei)
+        num_document_chunks, num_neighbors, ret_size, hidden_dim = nei.shape
+
+        if nei_position_ids is None:
+            nei_position_ids = torch.arange(ret_size)
+            nei_position_ids = torch.broadcast_to(nei_position_ids[None, None, :],
+                                                  (num_document_chunks, num_neighbors, ret_size))
+        else:
+            nei_position_ids = nei_position_ids.reshape([num_document_chunks, num_neighbors, ret_size])
+        query = query.reshape([-1, chunk_size, hidden_dim])
+        query_attention_mask = query_attention_mask.reshape([-1, chunk_size])
+        # ###
+        if self.config.apply_query_to_nei_att:
+            query_w_nei = self.query_to_nei_att(query,
+                                                key_value_states=einops.rearrange(nei, 'b k r d-> b (k r) d'),
+                                                attention_mask=einops.rearrange(nei_attention_mask, 'b k r -> b (k r)'),
+                                                kv_position_ids=einops.rearrange(nei_position_ids, 'b k r -> b (k r)'))
+            aug_query = query + query_w_nei[0]
+            aug_query = self.query_lowrank_mlp(self.query_lowrank_mlp_ln(aug_query)) + aug_query
+            aug_query = aug_query.reshape(original_query.shape)
+            if self.query_gate is not None:
+                # if using griffin gate, beta is between [0 ,  U[0.1, 0.7] ] at init.
+                # alpha is in [U[0.3, 0.9] , 1] at init.
+                ######
+                # at init query_alpha should be at least ~0.99
+                query_alpha, query_beta = self.query_gate(aug_query)
+            else:
+                query_alpha, query_beta = 0, 1
+            query_gate = query_alpha * original_query + query_beta * aug_query
+
+        # TODO: remove with_sharding_constraint
+        copied_query = einops.repeat(query, "b c d -> (b k) c d", k=num_neighbors)
+        # copied_query = with_sharding_constraint(copied_query, PS(("dp", "fsdp"), None, "mp"))
+        copied_q_mask = einops.repeat(query_attention_mask, "b c -> (b k) c", k=num_neighbors)
+        # copied_q_mask = with_sharding_constraint(copied_q_mask, PS(("dp", "fsdp"), None))
+        nei = einops.rearrange(nei, 'b k r d -> (b k) r d')
+        nei_w_query = self.nei_to_query_att(nei,
+                                            key_value_states=copied_query,
+                                            attention_mask=copied_q_mask
+                                            )
+        print(f"{nei_w_query=}", flush=True)
+        aug_nei = nei + nei_w_query[0]
+        aug_nei = self.nei_lowrank_mlp(self.nei_lowrank_mlp_ln(aug_nei)) + aug_nei
+        aug_nei = aug_nei.reshape(original_nei.shape)
+        if self.nei_gate is not None:
+            # at init nei_alpha should be at ~0.9 in first layer, 0.95 in second and 0.99 in third.
+            nei_alpha, nei_beta = self.nei_gate(aug_nei)
+        else:
+            nei_alpha, nei_beta = 0, 1
+        nei_gate = nei_alpha * original_nei + nei_beta * aug_nei
+        if self.config.apply_query_to_nei_att:
+            return query_gate, nei_gate
+        else:
+            return original_query, nei_gate
+
+
+class GPTNeoXQueryAugmentor(nn.Module):
+
+    def __init__(self, config, dtype):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.layers = [GPTNeoXQueryAugmentorLayer(self.config, dtype=self.dtype) for _ in
+                       range(self.config.n_query_aug_layers)]
+
+    def forward(self, query, query_attention_mask, nei, nei_attention_mask):
+        original_nei = nei
+
+        for i, layer in enumerate(self.layers):
+            query, nei = layer(query,
+                               query_attention_mask,
+                               nei,
+                               nei_attention_mask,
+                               None,
+                               None,
+                               is_last=i == self.config.n_query_aug_layers - 1
+                               )
+
+        return nei
+
+
+class GPTNeoXBlock(nn.Module):
+    def __init__(self, config, dtype, has_cca):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.has_cca = has_cca
+
+        self.use_parallel_residual = self.config.use_parallel_residual
+        self.input_layernorm = nn.LayerNorm(normalized_shape=self.config.hidden_size, eps=self.config.layer_norm_eps,
+                                            dtype=self.dtype)
+        attention_module = GPTNeoXAttention
+        self.attention = attention_module(self.config, dtype=self.dtype)
+        self.post_attention_dropout = nn.Dropout(p=self.config.hidden_dropout)
+        self.post_attention_layernorm = nn.LayerNorm(normalized_shape=self.config.hidden_size,
+                                                     eps=self.config.layer_norm_eps, dtype=self.dtype)
+
+        self.mlp = GPTNeoXMLP(self.config, dtype=self.dtype)
+        self.post_mlp_dropout = nn.Dropout(p=self.config.hidden_dropout)
+        if self.has_cca:
+            self.cca = GPTNeoXChunkedCrossAttention(
+                self.config,
+                dtype=self.dtype,
+            )
+            self.cca_norm = nn.LayerNorm(
+                normalized_shape=self.config.hidden_size,
+                eps=self.config.layer_norm_eps,
+                dtype=self.dtype,
+            )
+        else:
+            self.cca = None
+            self.cca_norm = None
 
     def forward(
-        self,
-        hidden_states: Optional[torch.FloatTensor],
-        attention_mask: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = False,
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: Optional[bool] = False,
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            neighbor_hidden_states=None,
+            neighbor_mask=None,
+            nei_position_ids=None,
+            att_scores=None,
+            chunk_index=None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            cca_kwargs: Optional[Dict] = None,
+            # use_cca_cache:bool=False,
     ):
-        attention_layer_outputs = self.attention(
-            self.input_layernorm(hidden_states),
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            layer_past=layer_past,
-            head_mask=head_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
+        # hidden_states = with_sharding_constraint(hidden_states, PS(("dp", "fsdp"), None, "mp"))
+        print(f"{hidden_states=}", flush=True)
+        if self.cca is not None and (neighbor_hidden_states is not None):
+            cca_output = self.cca(hidden_states=self.cca_norm(hidden_states),
+                                  neighbor_hidden_states=neighbor_hidden_states,
+                                  neighbor_mask=neighbor_mask,
+                                  nei_position_ids=nei_position_ids,
+                                  att_scores=att_scores,
+                                  position_ids=chunk_index,
+                                  output_attentions=output_attentions,
+                                  deterministic=deterministic,
+                                  **(cca_kwargs if cca_kwargs is not None else dict())
+
+                                  )
+            cca_hidden_states = cca_output[0]
+            if self.config.apply_tanh_in_cca:
+                cca_hidden_states = (30 * torch.tanh(cca_hidden_states / 30)).type(cca_hidden_states.dtype)
+            if not self.use_parallel_residual:
+                hidden_states = cca_hidden_states + hidden_states
+        else:
+            cca_hidden_states = None
+
+        att_input = self.input_layernorm(hidden_states).type(self.dtype)
+        print(f"{att_input=}", flush=True)
+        # att_input = with_sharding_constraint(att_input, PS(("dp", "fsdp"), None, "mp"))
+        # attention_mask = with_sharding_constraint(attention_mask, PS(("dp", "fsdp"), None))
+
+        attn_outputs = self.attention(
+            att_input,
+            attention_mask,
+            position_ids,
+            deterministic,
+            init_cache,
+            output_attentions,
         )
-        attn_output = attention_layer_outputs[0]  # output_attn: attn_output, present, (attn_weights)
-        attn_output = self.post_attention_dropout(attn_output)
-        outputs = attention_layer_outputs[1:]
+        attn_output = attn_outputs[0]
+        attn_output = self.post_attention_dropout(attn_output)  # TODO: Handle deterministic
+        # attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), None, "mp"))
 
         if self.use_parallel_residual:
             # pseudocode:
             # x = x + attn(ln1(x)) + mlp(ln2(x))
-            mlp_output = self.mlp(self.post_attention_layernorm(hidden_states))
-            mlp_output = self.post_mlp_dropout(mlp_output)
-            hidden_states = mlp_output + attn_output + hidden_states
+            mlp_output = self.mlp(self.post_attention_layernorm(hidden_states).astype(self.dtype))
+            # mlp_output = with_sharding_constraint(mlp_output, PS(("dp", "fsdp"), None, "mp"))
+            mlp_output = self.post_mlp_dropout(mlp_output)  # TODO: Handle deterministic
+            if cca_hidden_states is None:
+                hidden_states = mlp_output + attn_output + hidden_states
+            else:
+                if self.config.log_debug_metrics and not self.is_initializing():
+                    # TODO: Handle
+                    cca_hidden_states_norm = torch.norm(cca_hidden_states, dim=-1).mean(where=attention_mask > 0)
+                    att_hidden_states_norm = torch.norm(attn_output, dim=-1).mean(where=attention_mask > 0)
+                    mlp_hidden_states_norm = torch.norm(mlp_output, dim=-1).mean(where=attention_mask > 0)
+                    residual_hidden_states_norm = torch.norm(hidden_states, dim=-1).mean(where=attention_mask > 0)
+                    self.sow('intermediates', f'cca_hidden_states_norm', cca_hidden_states_norm)
+                    self.sow('intermediates', f'att_hidden_states_norm', att_hidden_states_norm)
+                    self.sow('intermediates', f'mlp_hidden_states_norm', mlp_hidden_states_norm)
+                    self.sow('intermediates', f'residual_hidden_states_norm', residual_hidden_states_norm)
+                hidden_states = mlp_output + attn_output + cca_hidden_states + hidden_states
+                if self.config.log_debug_metrics and not self.is_initializing():
+                    added_hidden_states_norm = torch.norm(hidden_states, dim=-1).mean(where=attention_mask > 0)
+                    self.sow('intermediates', f'added_hidden_states_norm', added_hidden_states_norm)
         else:
             # pseudocode:
             # x = x + attn(ln1(x))
             # x = x + mlp(ln2(x))
+
             attn_output = attn_output + hidden_states
             mlp_output = self.mlp(self.post_attention_layernorm(attn_output))
-            mlp_output = self.post_mlp_dropout(mlp_output)
+            mlp_output = self.post_mlp_dropout(mlp_output, deterministic=deterministic)
             hidden_states = mlp_output + attn_output
-
-        if use_cache:
-            outputs = (hidden_states,) + outputs  # hidden_states, present, (attn_weights)
-        else:
-            outputs = (hidden_states,) + outputs[1:]  # hidden_states, (attn_weights)
-
-        return outputs
+        # hidden_states = with_sharding_constraint(hidden_states, PS(("dp", "fsdp"), None, "mp"))
+        return (hidden_states,) + attn_outputs[1:]
 
 
 GPT_NEOX_START_DOCSTRING = r"""
@@ -1004,6 +1305,363 @@ GPT_NEOX_INPUTS_DOCSTRING = r"""
 """
 
 
+def topk_chunks(retriever_scores, num_candidates, *, where=None):
+    # TODO: @jax.vmap
+    def _topk_chunks(retriever_scores):
+        return (-retriever_scores).argsort()[:num_candidates]  # k = num_candidates
+
+    if where is not None:
+        retriever_scores[~where] = -torch.inf
+    return _topk_chunks(retriever_scores)
+
+
+def create_segment_mask(total_num_chunks, n_skip_chunks):
+    # TODO: @jax.vmap
+    def _create_segment_mask(chunk_index):
+        max_chunk = n_skip_chunks * (chunk_index // n_skip_chunks)
+        return torch.arange(total_num_chunks) < max_chunk - 2
+
+    return _create_segment_mask(torch.arange(total_num_chunks))
+
+
+# TODO: @jax.vmap
+def _ranksigrelu(scores, mask, pair_mask, weights=None):
+    score_i = scores.unsqueeze(-1)
+    score_j = scores.unsqueeze(-1).unsqueeze(-1)
+    score_pairs = torch.sigmoid((score_i - score_j))
+    if weights is not None:
+        score_pairs = weights.reshape(score_pairs.shape) * score_pairs
+
+    pair_mask = pair_mask.reshape(score_pairs.shape)
+    x = torch.sum(torch.maximum(score_pairs[pair_mask], torch.tensor(0)), dim=-1)
+    x = x - torch.max(torch.maximum(x[mask], torch.tensor(0)), dim=-1)
+    mask = mask.any(-1).unsqueeze(-1)
+    x[~mask] = 0.0
+    return x
+
+def compute_pairs(a, op):
+    """Computes pairs based on values of `a` and the given pairwise `op`.
+
+  Args:
+    a: The array used to form pairs. The last axis is used to form pairs.
+    op: The binary op to map a pair of values to a single value.
+
+  Returns:
+    A :class:`jax.Array` with the same leading dimensions as `a`, but with the
+    last dimension expanded so it includes all pairs `op(a[..., i], a[..., j])`
+  """
+    a_i = a.unsqueeze(-1)
+    a_j = a.unsqueeze(-1).unsqueeze(-1)
+    result_shape = torch.broadcast_shapes(a_i.shape, a_j.shape)
+    result = torch.broadcast_to(op(a_i, a_j), result_shape)
+    out_shape = tuple(result.shape[:-2]) + (result.shape[-2] * result.shape[-1],)
+    return torch.reshape(result, out_shape)
+
+
+def ranksigrelu(
+        scores, mask, pair_mask=None, weights=None, margin=0, offset=1.0, substract_max=True,
+):
+    mask = mask.astype(torch.bool)
+    if pair_mask is None:
+        pair_mask = compute_pairs(mask, torch.logical_and)
+    if weights is None:
+        weights = torch.ones_like(pair_mask)
+    if substract_max:
+        # TODO verify
+        scores_max = torch.max(torch.maximum(scores[mask], torch.tensor(0)), dim=-1).unsqueeze(-1)
+        scores = scores - scores_max
+    scores = _ranksigrelu(scores, mask, pair_mask, weights)
+
+    scores = scores + offset + margin
+    scores = torch.nn.functional.softplus(scores)
+    scores = torch.where(scores > 0, scores, 0)
+    return scores
+
+
+class GPTNeoXRetriever(nn.Module):
+
+    def __init__(self, config, dtype):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+
+        self.preret_bidir_attention = GPTNeoXCrossAttention(self.config, dtype=self.dtype)
+        self.preret_bi_attention_norm = nn.LayerNorm(normalized_shape=self.config.hidden_size,
+                                                     eps=self.config.layer_norm_eps, dtype=self.dtype)
+        self.pre_key_norm = nn.LayerNorm(normalized_shape=self.config.hidden_size, eps=self.config.layer_norm_eps,
+                                         dtype=self.dtype, )
+        self.key_projection = nn.Linear(
+            self.config.hidden_size,
+            self.config.hidden_size,
+            dtype=self.dtype,
+            bias=True,
+        )
+        self.pre_query_norm = nn.LayerNorm(normalized_shape=self.config.hidden_size,
+                                           eps=self.config.layer_norm_eps,
+                                           dtype=self.dtype, )
+        self.query_projection = nn.Linear(
+            self.config.hidden_size,
+            self.config.hidden_size,
+            dtype=self.dtype,
+            bias=True,
+        )
+        self.fill_value = self.config.retriever_fill_value
+        self.n_skip_chunks = self.config.max_position_embeddings // self.config.chunk_size
+        self.num_neighbors = self.config.num_neighbors
+        self.threshold_nei_scores = self.config.threshold_nei_scores
+        self.num_sequence_chunks = self.config.max_position_embeddings // self.config.chunk_size
+        self.learned_margin = nn.Parameter(torch.tensor(0))
+
+        self.scheduled_sampling_schedule_fn = None
+
+    def compute_query_scores(self, encoded_output, n_skip_chunks, num_neighbors):
+        query_based_scores = torch.einsum('qd,kd->qk', encoded_output.query_chunks,
+                                          encoded_output.key_chunks)
+
+        if n_skip_chunks > 0:
+            chunk_mask = encoded_output.chunk_mask
+            segment_mask = create_segment_mask(query_based_scores.shape[0], n_skip_chunks)
+            chunk_mask &= segment_mask
+        else:
+            chunk_mask = torch.ones_like(query_based_scores).type(torch.bool)
+        query_score_based_idx = topk_chunks(query_based_scores, num_candidates=num_neighbors, where=chunk_mask)
+        return query_based_scores, query_score_based_idx, chunk_mask
+
+    def apply_scaling(self, scores, chunk_mask):
+        scaled_scores = ranksigrelu(scores / self.config.score_temp,
+                                    chunk_mask,
+                                    margin=torch.nn.functional.softplus(self.learned_margin),
+                                    offset=self.config.atsc_margin_min)
+
+        return scaled_scores
+
+    def batch_take_along_axis(self, scaled_scores, chunk_mask, idxs):
+        idx_scores = torch.take_along_axis(scaled_scores, idxs, axis=-1)
+        idx_mask = torch.take_along_axis(chunk_mask, idxs, axis=-1)
+        return idx_scores, idx_mask
+
+    def forward(
+            self,
+            encoded_output,
+            append_next_chunk: Optional[bool] = None,
+            n_skip_chunks: Optional[int] = None,
+            num_neighbors: Optional[int] = None,
+    ):
+        if append_next_chunk is None:
+            append_next_chunk = self.config.append_next_chunk
+        if n_skip_chunks is None:
+            n_skip_chunks = self.n_skip_chunks
+        if num_neighbors is None:
+            num_neighbors = self.num_neighbors
+
+        query_based_scores, query_score_based_idx, chunk_mask = self.compute_query_scores(encoded_output, n_skip_chunks,
+                                                                                          num_neighbors)
+        scaled_scores = self.apply_scaling(query_based_scores, chunk_mask)
+        query_att_scores, query_neighbor_mask = self.batch_take_along_axis(scaled_scores, chunk_mask,
+                                                                           query_score_based_idx)
+
+        self.sow('intermediates', f'query_att_scores', query_att_scores)
+        top_nei_idx, nei_mask, att_scores = query_score_based_idx, query_neighbor_mask, query_att_scores
+        aux_loss = None
+        ret_metrics = {}
+
+        att_scores[att_scores <= 0] = 0
+        if self.config.stop_grad_trick:
+            # TODO: 0 with att_scores dim
+            att_scores = att_scores - att_scores
+
+            # if self.config.log_debug_metrics and not self.is_initializing():
+            #     self.sow('intermediates', f'nei_mask', nei_mask)
+            #     self.sow('intermediates', f'pre_nei_mask', pre_nei_mask)
+            #     self.sow('intermediates', f'neighbor_attention_mask', neighbor_attention_mask)
+        neighbor_hidden_states, neighbor_mask, nei_position_ids, att_scores = self.select_nei(encoded_output,
+                                                                                              top_nei_idx, nei_mask,
+                                                                                              att_scores, num_neighbors,
+                                                                                              append_next_chunk)
+
+        loss_scale = None
+        return GPTNeoXRetrieverNeighborOutput(aux_loss=aux_loss,
+                                              neighbor_hidden_states=neighbor_hidden_states,
+                                              loss_scale=loss_scale,
+                                              neighbor_mask=neighbor_mask,
+                                              retrieval_metrics=ret_metrics,
+                                              att_scores=att_scores,
+                                              encoded_output=encoded_output,
+                                              nei_position_ids=nei_position_ids,
+                                              )
+
+    def select_nei(self, encoded_output, top_nei_idx, nei_mask, att_scores, num_neighbors, append_next_chunk):
+        cand_hidden_states = encoded_output.encoded_hidden_states
+        cand_attention_mask = encoded_output.attention_mask
+        if not self.config.apply_refactor:
+            chunk_size = self.config.chunk_size
+            num_document_chunks = top_nei_idx.shape[0]
+            shifted_hidden_states = torch.pad(cand_hidden_states[1:, ...], ((0, 1), (0, 0), (0, 0)))
+            curr_neighbor_hidden_states = cand_hidden_states[top_nei_idx.reshape(-1)]
+            next_neighbor_hidden_states = shifted_hidden_states[top_nei_idx.reshape(-1)]
+            neighbor_hidden_states = torch.concatenate((curr_neighbor_hidden_states, next_neighbor_hidden_states),
+                                                       dim=-2)
+            neighbor_hidden_states = einops.rearrange(neighbor_hidden_states, '(b k) r d -> b k r d',
+                                                      b=num_document_chunks)
+            neighbor_mask = torch.broadcast_to(nei_mask.unsqueeze(-1), neighbor_hidden_states.shape[:-1])
+            nei_position_ids = torch.arange(2 * chunk_size)
+            nei_position_ids = torch.broadcast_to(nei_position_ids[None, :],
+                                                  (num_document_chunks * num_neighbors, 2 * chunk_size))
+
+        else:
+            neighbor_hidden_states, neighbor_mask, nei_position_ids = new_lookup_neighbors(top_nei_idx,
+                                                                                           cand_hidden_states,
+                                                                                           cand_attention_mask,
+                                                                                           append_next_chunk,
+                                                                                           nei_mask=nei_mask)
+
+            if self.config.ret_score_in_cca:
+                att_scores = torch.broadcast_to(att_scores.unsqueeze(-1), neighbor_hidden_states.shape[:-1])
+        return neighbor_hidden_states, neighbor_mask, nei_position_ids, att_scores
+
+    def preret_encode(self,
+                      hidden_states,
+                      attention_mask,
+                      deterministic,
+                      pooling_size: int,
+                      output_attentions: bool = False, ):
+        original_hidden_states_shape = hidden_states.shape
+        original_attention_mask_shape = attention_mask.shape
+        # print(hidden_states.shape)
+
+        original_hidden_states = einops.rearrange(hidden_states, 'b (l c) ... -> (b l) c ... ',
+                                                  c=self.config.chunk_size)
+        attention_mask = einops.rearrange(attention_mask, 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size)
+
+        # add a chunk dimension
+        # 1. apply bi-dir attention
+        preret_bi_output = self.preret_bidir_attention(
+            self.preret_bi_attention_norm(original_hidden_states),
+            attention_mask=attention_mask,
+            deterministic=deterministic,
+            output_attentions=output_attentions)
+        encoded_hidden_states = preret_bi_output[0] + original_hidden_states
+
+        # 2. pool
+        pooled_hidden_states = encoded_hidden_states.mean(dim=-2)
+
+        # 3. project to query chunks and key chunks
+        key_chunks = self.key_projection(self.pre_key_norm(pooled_hidden_states))
+        query_chunks = self.query_projection(self.pre_query_norm(pooled_hidden_states))
+        chunk_mask = attention_mask.type(torch.bool).any(-1)[..., None]
+        if chunk_mask.shape[0] != pooled_hidden_states.shape[0]:
+            chunk_mask = chunk_mask[:pooled_hidden_states.shape[0], ...]
+
+        # nei_pos = jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0, a_max=2*self.config.chunk_size-1)
+        original_hidden_states = original_hidden_states.reshape(original_hidden_states_shape)
+        attention_mask = attention_mask.reshape(original_attention_mask_shape)
+
+        key_chunks = key_chunks / torch.linalg.norm(key_chunks, dim=-1).unsqueeze(-1)
+        query_chunks = query_chunks / torch.linalg.norm(query_chunks, dim=-1).unsqueeze(-1)
+
+        return GPTNeoXRetrieverEncodedOutput(
+            original_hidden_states=original_hidden_states,
+            encoded_hidden_states=encoded_hidden_states,
+            attention_mask=attention_mask,
+            key_chunks=key_chunks,
+            query_chunks=query_chunks,
+            chunk_mask=chunk_mask,
+            preret_attention=preret_bi_output[1:],
+            # nei_position_ids=nei_pos,
+        )
+
+
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithCrossAttentions
+
+
+class GPTNeoXBlockCollection(nn.Module):
+    def __init__(self, config, dtype):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.first_upcoder_layer = self.config.num_hidden_layers // 2
+        self.lowcoder_layer_idxs = torch.arange(self.first_upcoder_layer)
+        self.upcoder_layer_idxs = torch.arange(self.first_upcoder_layer, self.config.num_hidden_layers)
+        if self.config.cca_freq > 0:
+            self.cca_layer_idxs = torch.arange(self.first_upcoder_layer,
+                                               self.config.num_hidden_layers,
+                                               self.config.cca_freq)
+        else:
+            self.cca_layer_idxs = set()
+
+        self.blocks = [
+            GPTNeoXBlock(self.config, dtype=self.dtype, has_cca=i in list(self.cca_layer_idxs))
+            for i in range(self.config.num_hidden_layers)
+        ]
+
+    def forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            neighbor_hidden_states=None,
+            neighbor_mask=None,
+            nei_position_ids=None,
+            att_scores=None,
+            chunk_index=None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+            mode: str = "all",
+            cca_kwargs: Optional[Dict] = None,
+            # use_cca_cache:bool=False
+    ):
+        if mode == "all":
+            blocks = self.blocks
+        elif mode == "lowcoder":
+            blocks = [self.blocks[i] for i in self.lowcoder_layer_idxs]
+        elif mode == "upcoder":
+            blocks = [self.blocks[i] for i in self.upcoder_layer_idxs]
+        else:
+            raise ValueError(f"mode {mode} not recognized")
+
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+        all_cross_attentions = () if output_attentions else None
+
+        for block in blocks:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = block(
+                hidden_states,
+                attention_mask,
+                position_ids=position_ids,
+                neighbor_hidden_states=neighbor_hidden_states,
+                neighbor_mask=neighbor_mask,
+                nei_position_ids=nei_position_ids,
+                att_scores=att_scores,
+                chunk_index=chunk_index,
+                deterministic=deterministic,
+                init_cache=init_cache,
+                output_attentions=output_attentions,
+                cca_kwargs=cca_kwargs,
+            )
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_attentions += (layer_outputs[1],)
+                if block.has_cca:
+                    all_cross_attentions += (layer_outputs[2],)
+
+        if not return_dict:
+            return (hidden_states,) + (all_hidden_states, all_attentions, all_cross_attentions)
+
+        return BaseModelOutputWithCrossAttentions(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            cross_attentions=all_cross_attentions,
+        )
+
+
 @add_start_docstrings(
     "The bare GPTNeoX Model transformer outputting raw hidden-states without any specific head on top.",
     GPT_NEOX_START_DOCSTRING,
@@ -1015,14 +1673,44 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
 
         self.embed_in = nn.Embedding(config.vocab_size, config.hidden_size)
         self.emb_dropout = nn.Dropout(config.hidden_dropout)
-        self.layers = nn.ModuleList([GPTNeoXLayer(config) for _ in range(config.num_hidden_layers)])
+        # self.layers = nn.ModuleList([GPTNeoXLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = GPTNeoXBlockCollection(self.config, dtype=self.dtype)
         self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+        if self.config.cca_freq > 0:
+            self.retriever = GPTNeoXRetriever(self.config, dtype=self.dtype)
+        else:
+            self.retriever = None
+        if self.config.n_query_aug_layers is not None and self.config.n_query_aug_layers > 0:
+            self.query_augmentor = GPTNeoXQueryAugmentor(self.config, dtype=self.dtype)
+        else:
+            self.query_augmentor = None
 
-        self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
-        self.post_init()
+    def lowcoder(self,
+                 input_ids,
+                 attention_mask,
+                 position_ids,
+                 deterministic=True,
+                 init_cache: bool = False,
+                 output_attentions: bool = False,
+                 output_hidden_states: bool = False,
+                 return_dict: bool = True,
+                 # use_cca_cache:bool=False,
+                 ):
+        input_embeds = self.embed_in(input_ids.type(torch.int))
+        hidden_states = self.emb_dropout(input_embeds, deterministic=deterministic)
+        lowcoder_outputs = self.layers(
+            hidden_states,
+            attention_mask,
+            position_ids=position_ids,
+            deterministic=deterministic,
+            init_cache=init_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            mode="lowcoder",
+            # use_cca_cache=use_cca_cache,
+        )
+        return lowcoder_outputs
 
     def get_input_embeddings(self):
         return self.embed_in
@@ -1038,17 +1726,17 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         r"""
         past_key_values (`tuple(tuple(torch.FloatTensor))` of length `config.n_layers` with each tuple having 4 tensors of shape `(batch_size, num_heads, sequence_length - 1, embed_size_per_head)`):
@@ -1205,18 +1893,18 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
     @add_start_docstrings_to_model_forward(GPT_NEOX_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
@@ -1298,7 +1986,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+            self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
         input_shape = input_ids.shape
         # cut decoder_input_ids if past is used
@@ -1320,7 +2008,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
+                position_ids = position_ids[:, -input_ids.shape[1]:]
 
         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
         if attention_mask is None:
@@ -1352,304 +2040,677 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
         return reordered_past
 
 
-@add_start_docstrings(
+class GPTNeoXPreTrainedModel(PreTrainedModel):
     """
-    The GPTNeoX Model transformer with a sequence classification head on top (linear layer).
+    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
+    models.
+    """
 
-    [`GPTNeoXForSequenceClassification`] uses the last token in order to do the classification, as other causal models
-    (e.g. GPT-1) do.
+    config_class = GPTNeoXConfig
+    base_model_prefix = "gpt_neox"
 
-    Since it does classification on the last token, it requires to know the position of the last token. If a
-    `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
-    no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
-    padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
-    each row of the batch).
-    """,
-    GPT_NEOX_START_DOCSTRING,
-)
-class GPTNeoXForSequenceClassification(GPTNeoXPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.gpt_neox = GPTNeoXModel(config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+    # Copied from transformers.models.gpt_neo.modeling_flax_gpt_neo.FlaxGPTNeoPreTrainedModel.__init__ with GPTNeo->GPTNeoX
+    def __init__(
+            self,
+            config: GPTNeoXConfig,
+            input_shape: Tuple = (1, 128),
+            seed: int = 0,
+            dtype: torch.dtype = torch.float32,
+            _do_init: bool = True,
+            **kwargs,
+    ):
+        super().__init__(config, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
 
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @add_start_docstrings_to_model_forward(GPT_NEOX_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=SequenceClassifierOutputWithPast,
-        config_class=_CONFIG_FOR_DOC,
-    )
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutputWithPast]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.gpt_neox(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+    def sample(
+            self,
+            input_ids: torch.LongTensor,
+            logits_processor: Optional[LogitsProcessorList] = None,
+            stopping_criteria: Optional[StoppingCriteriaList] = None,
+            logits_warper: Optional[LogitsProcessorList] = None,
+            max_length: Optional[int] = None,
+            pad_token_id: Optional[int] = None,
+            eos_token_id: Optional[Union[int, List[int]]] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            output_scores: Optional[bool] = None,
+            output_logits: Optional[bool] = None,
+            return_dict_in_generate: Optional[bool] = None,
+            synced_gpus: bool = False,
+            streamer: Optional["BaseStreamer"] = None,
+            **model_kwargs,
+    ) -> Union[tuple[GenerateEncoderDecoderOutput, Any], tuple[GenerateDecoderOnlyOutput, Any], tuple[
+        Union[torch.Tensor, torch.LongTensor], Any]]:
+        # init values
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+        if max_length is not None:
+            warnings.warn(
+                "`max_length` is deprecated in this function, use"
+                " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
+                UserWarning,
+            )
+            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+        logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
+        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+        if isinstance(eos_token_id, int):
+            eos_token_id = [eos_token_id]
+        eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
+        output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
+        output_logits = output_logits if output_logits is not None else self.generation_config.output_logits
+        output_attentions = (
+            output_attentions if output_attentions is not None else self.generation_config.output_attentions
         )
-        hidden_states = outputs[0]
-        logits = self.score(hidden_states)
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
+        )
+        return_dict_in_generate = (
+            return_dict_in_generate
+            if return_dict_in_generate is not None
+            else self.generation_config.return_dict_in_generate
+        )
 
-        if input_ids is not None:
-            batch_size, sequence_length = input_ids.shape[:2]
-        else:
-            batch_size, sequence_length = inputs_embeds.shape[:2]
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        raw_logits = () if (return_dict_in_generate and output_logits) else None
+        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
 
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
-                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-                sequence_lengths = sequence_lengths.to(logits.device)
-            else:
-                sequence_lengths = -1
-                logger.warning(
-                    f"{self.__class__.__name__} will not detect padding tokens in `inputs_embeds`. Results may be "
-                    "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        if return_dict_in_generate and self.config.is_encoder_decoder:
+            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            )
+
+        # keep track of which sequences are already finished
+        unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
+
+        this_peer_finished = False  # used by synced_gpus only
+        # auto-regressive generation
+        while True:
+            if synced_gpus:
+                # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
+                # The following logic allows an early break if all peers finished generating their sequence
+                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+                # send 0.0 if we finished, 1.0 otherwise
+                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
+                # did all peers finish? the reduced sum will be 0.0 then
+                if this_peer_finished_flag.item() == 0.0:
+                    break
+
+            # prepare model inputs
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+
+            # forward pass to get next token
+            outputs = self(
+                **model_inputs,
+                return_dict=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                init_cache=True,
+            )
+
+            if synced_gpus and this_peer_finished:
+                continue  # don't waste resources running the code we don't need
+
+            next_token_logits = outputs.logits[:, -1, :]
+
+            # pre-process distribution
+            next_token_scores = logits_processor(input_ids, next_token_logits)
+            next_token_scores = logits_warper(input_ids, next_token_scores)
+
+            # Store scores, attentions and hidden_states when required
+            if return_dict_in_generate:
+                if output_scores:
+                    scores += (next_token_scores,)
+                if output_logits:
+                    raw_logits += (next_token_logits,)
+                if output_attentions:
+                    decoder_attentions += (
+                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                    )
+                    if self.config.is_encoder_decoder:
+                        cross_attentions += (outputs.cross_attentions,)
+
+                if output_hidden_states:
+                    decoder_hidden_states += (
+                        (outputs.decoder_hidden_states,)
+                        if self.config.is_encoder_decoder
+                        else (outputs.hidden_states,)
+                    )
+
+            # sample
+            probs = nn.functional.softmax(next_token_scores, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+            # finished sentences should have their next token be a padding token
+            if eos_token_id is not None:
+                if pad_token_id is None:
+                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            # update generated ids, model inputs, and length for next step
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if streamer is not None:
+                streamer.put(next_tokens.cpu())
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+
+            # if eos_token was found in one sentence, set sentence to finished
+            if eos_token_id_tensor is not None:
+                unfinished_sequences = unfinished_sequences.mul(
+                    next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
                 )
 
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+                # stop when each sentence is finished
+                if unfinished_sequences.max() == 0:
+                    this_peer_finished = True
 
-        loss = None
-        if labels is not None:
-            labels = labels.to(logits.device)
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.config.problem_type = "single_label_classification"
-                else:
-                    self.config.problem_type = "multi_label_classification"
+            # stop if we exceed the maximum length
+            if stopping_criteria(input_ids, scores):
+                this_peer_finished = True
 
-            if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(pooled_logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
-                loss = loss_fct(pooled_logits, labels)
-        if not return_dict:
-            output = (pooled_logits,) + outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+            if this_peer_finished and not synced_gpus:
+                break
 
-        return SequenceClassifierOutputWithPast(
-            loss=loss,
-            logits=pooled_logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+        if streamer is not None:
+            streamer.end()
+
+        last_lowcoder_states = self.transformer.cached_array
+
+        encoded_lowcoder_states = self.preret_forward(
+            hidden_states=last_lowcoder_states,
+            attention_mask=torch.ones(last_lowcoder_states.shape[:-1]))
+
+        if return_dict_in_generate:
+            if self.config.is_encoder_decoder:
+                return GenerateEncoderDecoderOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    encoder_attentions=encoder_attentions,
+                    encoder_hidden_states=encoder_hidden_states,
+                    decoder_attentions=decoder_attentions,
+                    cross_attentions=cross_attentions,
+                    decoder_hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                ), encoded_lowcoder_states
+            else:
+                return GenerateDecoderOnlyOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    attentions=decoder_attentions,
+                    hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                ), encoded_lowcoder_states
+        else:
+            return input_ids, encoded_lowcoder_states
+
+    def greedy_search(
+            self,
+            input_ids: torch.LongTensor,
+            logits_processor: Optional[LogitsProcessorList] = None,
+            stopping_criteria: Optional[StoppingCriteriaList] = None,
+            logits_warper: Optional[LogitsProcessorList] = None,
+            max_length: Optional[int] = None,
+            pad_token_id: Optional[int] = None,
+            eos_token_id: Optional[Union[int, List[int]]] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            output_scores: Optional[bool] = None,
+            output_logits: Optional[bool] = None,
+            return_dict_in_generate: Optional[bool] = None,
+            synced_gpus: bool = False,
+            streamer: Optional["BaseStreamer"] = None,
+            **model_kwargs,
+    ) -> Union[tuple[GenerateEncoderDecoderOutput, Any], tuple[GenerateDecoderOnlyOutput, Any], tuple[
+        Union[torch.Tensor, torch.LongTensor], Any]]:
+        # init values
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+        if max_length is not None:
+            warnings.warn(
+                "`max_length` is deprecated in this function, use"
+                " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
+                UserWarning,
+            )
+            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+        logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
+        pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+        if isinstance(eos_token_id, int):
+            eos_token_id = [eos_token_id]
+        eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
+        output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
+        output_logits = output_logits if output_logits is not None else self.generation_config.output_logits
+        output_attentions = (
+            output_attentions if output_attentions is not None else self.generation_config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
+        )
+        return_dict_in_generate = (
+            return_dict_in_generate
+            if return_dict_in_generate is not None
+            else self.generation_config.return_dict_in_generate
         )
 
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        raw_logits = () if (return_dict_in_generate and output_logits) else None
+        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
 
-class GPTNeoXForTokenClassification(GPTNeoXPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        if return_dict_in_generate and self.config.is_encoder_decoder:
+            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            )
 
-        self.gpt_neox = GPTNeoXModel(config)
-        self.dropout = nn.Dropout(config.classifier_dropout)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        # keep track of which sequences are already finished
+        unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
-        # Initialize weights and apply final processing
-        self.post_init()
+        this_peer_finished = False  # used by synced_gpus only
+        # auto-regressive generation
+        while True:
+            if synced_gpus:
+                # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
+                # The following logic allows an early break if all peers finished generating their sequence
+                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+                # send 0.0 if we finished, 1.0 otherwise
+                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
+                # did all peers finish? the reduced sum will be 0.0 then
+                if this_peer_finished_flag.item() == 0.0:
+                    break
 
-    @add_start_docstrings_to_model_forward(GPT_NEOX_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        checkpoint="LarsJonasson/pythia-410m-deduped-sft-swedish",
-        output_type=TokenClassifierOutput,
-        config_class=_CONFIG_FOR_DOC,
-        expected_loss=0.25,
-    )
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, TokenClassifierOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+            # prepare model inputs
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-        outputs = self.gpt_neox(
+            # forward pass to get next token
+            outputs = self(
+                **model_inputs,
+                return_dict=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                init_cache=True,
+            )
+
+            if synced_gpus and this_peer_finished:
+                continue  # don't waste resources running the code we don't need
+
+            next_token_logits = outputs.logits[:, -1, :]
+
+            # pre-process distribution
+            next_token_scores = logits_processor(input_ids, next_token_logits)
+            next_token_scores = logits_warper(input_ids, next_token_scores)
+
+            # Store scores, attentions and hidden_states when required
+            if return_dict_in_generate:
+                if output_scores:
+                    scores += (next_token_scores,)
+                if output_logits:
+                    raw_logits += (next_token_logits,)
+                if output_attentions:
+                    decoder_attentions += (
+                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                    )
+                    if self.config.is_encoder_decoder:
+                        cross_attentions += (outputs.cross_attentions,)
+
+                if output_hidden_states:
+                    decoder_hidden_states += (
+                        (outputs.decoder_hidden_states,)
+                        if self.config.is_encoder_decoder
+                        else (outputs.hidden_states,)
+                    )
+
+            # sample
+            probs = nn.functional.softmax(next_token_scores, dim=-1)
+            next_tokens = torch.argmax(probs).squeeze(1)
+
+            # finished sentences should have their next token be a padding token
+            if eos_token_id is not None:
+                if pad_token_id is None:
+                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            # update generated ids, model inputs, and length for next step
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if streamer is not None:
+                streamer.put(next_tokens.cpu())
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+
+            # if eos_token was found in one sentence, set sentence to finished
+            if eos_token_id_tensor is not None:
+                unfinished_sequences = unfinished_sequences.mul(
+                    next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
+                )
+
+                # stop when each sentence is finished
+                if unfinished_sequences.max() == 0:
+                    this_peer_finished = True
+
+            # stop if we exceed the maximum length
+            if stopping_criteria(input_ids, scores):
+                this_peer_finished = True
+
+            if this_peer_finished and not synced_gpus:
+                break
+
+        if streamer is not None:
+            streamer.end()
+
+        last_lowcoder_states = self.transformer.cached_array
+
+        encoded_lowcoder_states = self.preret_forward(
+            hidden_states=last_lowcoder_states,
+            attention_mask=torch.ones(last_lowcoder_states.shape[:-1]))
+
+        if return_dict_in_generate:
+            if self.config.is_encoder_decoder:
+                return GenerateEncoderDecoderOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    encoder_attentions=encoder_attentions,
+                    encoder_hidden_states=encoder_hidden_states,
+                    decoder_attentions=decoder_attentions,
+                    cross_attentions=cross_attentions,
+                    decoder_hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                ), encoded_lowcoder_states
+            else:
+                return GenerateDecoderOnlyOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    attentions=decoder_attentions,
+                    hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                ), encoded_lowcoder_states
+        else:
+            return input_ids, encoded_lowcoder_states
+
+    def single_lowcoder_forward(
+            self,
             input_ids,
-            past_key_values=past_key_values,
+            attention_mask=None,
+            position_ids=None,
+            chunk_index=None,
+            params: dict = None,
+            train: bool = False,
+            past_key_values: dict = None,
+            output_attentions: bool = False,
+            dropout_rng=None,
+    ):
+
+        apply_kwargs = self.create_apply_kwargs(params, dropout_rng, past_key_values)
+
+        outputs = self.module.apply(
+            input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
+            deterministic=not train,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            method=self.module._lowcoder_forward,
+            **apply_kwargs
         )
+        return outputs
 
-        hidden_states = outputs[0]
-        hidden_states = self.dropout(hidden_states)
-        logits = self.classifier(hidden_states)
+    # def batch_lowcoder_forward(self, input_ids, attention_mask, params):
+    def batch_lowcoder_forward(self,
+                               input_ids,
+                               attention_mask=None,
+                               position_ids=None,
+                               chunk_index=None,
+                               params: dict = None,
+                               train: bool = False,
+                               past_key_values: dict = None,
+                               output_attentions: bool = False,
+                               dropout_rng=None,
+                               ):
 
-        loss = None
-        if labels is not None:
-            labels = labels.to(logits.device)
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-
-        if not return_dict:
-            output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
-
-        return TokenClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-
-@add_start_docstrings(
-    """
-    The GPT-NeoX Model transformer with a span classification head on top for extractive question-answering tasks like
-    SQuAD (a linear layer on top of the hidden-states output to compute `span start logits` and `span end logits`).
-    """,
-    GPT_NEOX_START_DOCSTRING,
-)
-class GPTNeoXForQuestionAnswering(GPTNeoXPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.gpt_neox = GPTNeoXModel(config)
-        self.qa_outputs = nn.Linear(config.hidden_size, 2)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @add_start_docstrings_to_model_forward(GPT_NEOX_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=QuestionAnsweringModelOutput,
-        config_class=_CONFIG_FOR_DOC,
-        real_checkpoint=_REAL_CHECKPOINT_FOR_DOC,
-    )
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        start_positions: Optional[torch.LongTensor] = None,
-        end_positions: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, QuestionAnsweringModelOutput]:
-        r"""
-        start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the start of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
-            are not taken into account for computing the loss.
-        end_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the end of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
-            are not taken into account for computing the loss.
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.gpt_neox(
-            input_ids,
+        apply_kwargs = self.create_apply_kwargs(params, dropout_rng, past_key_values)
+        # input_ids, attention_mask = jax.tree_map(reshape_for_vmap, (input_ids, attention_mask))
+        return self.module.apply(
+            input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
+            deterministic=not train,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            method=self.module._lowcoder_forward,
+            **apply_kwargs
         )
 
-        sequence_output = outputs[0]
+    def preret_forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            params: dict = None,
+            train: bool = False,
+            output_attentions: bool = False,
+            dropout_rng=None,
+    ):
 
-        logits = self.qa_outputs(sequence_output)
-        start_logits, end_logits = logits.split(1, dim=-1)
-        start_logits = start_logits.squeeze(-1).contiguous()
-        end_logits = end_logits.squeeze(-1).contiguous()
+        apply_kwargs = self.create_apply_kwargs(params, dropout_rng)
 
-        total_loss = None
-        if start_positions is not None and end_positions is not None:
-            # If we are on multi-GPU, split add a dimension
-            if len(start_positions.size()) > 1:
-                start_positions = start_positions.squeeze(-1).to(start_logits.device)
-            if len(end_positions.size()) > 1:
-                end_positions = end_positions.squeeze(-1).to(end_logits.device)
-            # sometimes the start/end positions are outside our model inputs, we ignore these terms
-            ignored_index = start_logits.size(1)
-            start_positions = start_positions.clamp(0, ignored_index)
-            end_positions = end_positions.clamp(0, ignored_index)
+        outputs = self.module.apply(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            deterministic=not train,
+            output_attentions=output_attentions,
+            method=self.module._encode_forward,
+            **apply_kwargs
+        )
 
-            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
-            start_loss = loss_fct(start_logits, start_positions)
-            end_loss = loss_fct(end_logits, end_positions)
-            total_loss = (start_loss + end_loss) / 2
+        return outputs
+
+    def create_apply_kwargs(self, params, dropout_rng, past_key_values=None):
+        rngs = {}
+        # Handle any PRNG if needed
+        if dropout_rng is not None:
+            rngs["dropout"] = dropout_rng
+
+        variables = {"params": params or self.params}
+
+        # if past_key_values are passed then cache is already initialized a private flag init_cache
+        # has to be passed down to ensure cache is used. It has to be made sure that cache is marked as mutable
+        # so that it can be changed by FlaxGPTJAttention module
+        if past_key_values is not None:
+            variables["cache"] = past_key_values
+            mutable = ["cache", "intermediates"]
+        else:
+            mutable = False
+        return dict(rngs=rngs, variables=variables, mutable=mutable)
+
+
+class GPTNeoXForCausalLMModule(nn.Module):
+    def __init__(self, config, dtype=torch.float32):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+
+        self.gpt_neox = GPTNeoXModel(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.embed_out = nn.Linear(
+            self.config.hidden_size,
+            self.config.vocab_size,
+            dtype=self.dtype,
+            bias=False,
+        )
+
+    def _lowcoder_forward(self, input_ids, attention_mask, position_ids, deterministic, output_attentions):
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        if position_ids is None:
+            position_ids = torch.broadcast_to(
+                torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0),
+                input_ids.shape
+            )
+        lowcoder_outputs = self.gpt_neox.lowcoder(
+            input_ids,
+            attention_mask,
+            position_ids,
+            deterministic=deterministic,
+            output_attentions=output_attentions,
+        )
+
+        outputs = self.gpt_neox.retriever.preret_encode(
+            lowcoder_outputs.last_hidden_state,
+            attention_mask,
+            deterministic,
+            input_ids.shape[-1],  # note this assumes we are chunked
+            output_attentions,
+        )
+        return outputs
+
+    def forward(
+            self,
+            input_ids,
+            attention_mask=None,
+            position_ids=None,
+            deterministic: bool = True,
+            lowonly_input_ids=None,
+            lowonly_attention_mask=None,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+            upcoder_input=None,
+            encoded_neighbors: Optional[EncodedNeighbors] = None,
+            chunk_index: Optional[torch.Tensor] = None,
+            retrieval_kwargs: Optional[dict] = None,
+    ):
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        else:
+            assert len(input_ids.shape) == len(
+                attention_mask.shape), "input_ids and attention_mask must have the same number of dimensions"
+
+        if position_ids is None:
+            position_ids = torch.broadcast_to(
+                torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0),
+                input_ids.shape
+            )
+        else:
+            assert len(input_ids.shape) == len(
+                position_ids.shape), "input_ids and position_ids must have the same number of dimensions"
+        should_squeeze = False
+        if len(input_ids.shape) == 2:
+            input_ids = input_ids[None, ...]
+            attention_mask = attention_mask[None, ...]
+            position_ids = position_ids[None, ...]
+            should_squeeze = True
+
+        transformer_input = dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            upcoder_input=upcoder_input,
+            encoded_neighbors=encoded_neighbors,
+            chunk_index=chunk_index,
+            lowonly_input_ids=lowonly_input_ids,
+            lowonly_attention_mask=lowonly_attention_mask,
+            retrieval_kwargs=retrieval_kwargs,
+        )
+
+        def transformer(**kwargs):
+            return self.gpt_neox(
+                deterministic=deterministic,
+                init_cache=init_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs,
+            )
+
+        # if jax.process_count() > 1 and not self.is_initializing():
+        #     transformer = jax.vmap(transformer)
+        #     outputs = transformer(**transformer_input)
+        #
+        # else:
+        # transformer_input = jax.tree_map(add_process_dim, transformer_input)
+        outputs = transformer(**transformer_input)
+        # outputs = jax.tree_map(remove_process_dim, outputs)
+
+        hidden_states = outputs.last_hidden_state if return_dict else outputs[0]
+
+        lm_logits = self.embed_out(hidden_states)
 
         if not return_dict:
-            output = (start_logits, end_logits) + outputs[2:]
-            return ((total_loss,) + output) if total_loss is not None else output
+            output = (lm_logits,) + outputs[1:]
+        else:
+            output = GPTNeoXLMOutput(
+                logits=lm_logits,
+                upcoder_hidden_states=outputs.upcoder_hidden_states,
+                upcoder_attentions=outputs.upcoder_attentions,
+                cross_attentions=outputs.cross_attentions,
+                lowcoder_last_hidden_state=outputs.lowcoder_last_hidden_state,
+                lowcoder_hidden_states=outputs.lowcoder_hidden_states,
+                lowcoder_attentions=outputs.lowcoder_attentions,
+                retriever_output=outputs.retriever_output,
+                retriever_input=outputs.retriever_input,
+            )
+        if should_squeeze:
+            output = output.squeeze(0)
+        return output
 
-        return QuestionAnsweringModelOutput(
-            loss=total_loss,
-            start_logits=start_logits,
-            end_logits=end_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+
+class FlaxGPTNeoXForCausalLM(GPTNeoXForCausalLMModule):
+
+    def prepare_inputs_for_generation(self,
+                                      input_ids,
+                                      max_length,
+                                      attention_mask: Optional[torch.Tensor] = None,
+                                      past_key_values=None,
+                                      **kwargs,
+                                      ):
+        # initializing the cache
+        batch_size, seq_length = input_ids.shape
+        if past_key_values is None:
+            past_key_values = self.init_cache(batch_size, max_length)
+
+        # Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
+        # But since GPTNeoX uses a causal mask, those positions are masked anyways.
+        # Thus we can create a single static attention_mask here, which is more efficient for compilation
+        extended_attention_mask = torch.ones((batch_size, max_length), dtype=torch.int32)
+        if attention_mask is not None:
+            position_ids = attention_mask.cumsum(dim=-1) - 1
+            extended_attention_mask = assign_slice(extended_attention_mask, attention_mask, (0, 0))
+        else:
+            position_ids = torch.broadcast_to(torch.arange(seq_length, dtype=torch.int32)[None, :],
+                                              (batch_size, seq_length))
+        chunk_index = torch.full([batch_size, 1], fill_value=63, dtype=torch.int32)
+        return {
+            "past_key_values": past_key_values,
+            "attention_mask": extended_attention_mask,
+            "position_ids": position_ids,
+            "chunk_index": chunk_index,
+            **kwargs
+        }
+
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        model_kwargs["past_key_values"] = model_outputs.past_key_values
+        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
+        if "chunk_index" in model_kwargs:
+            model_kwargs["chunk_index"] = torch.clip(model_kwargs["chunk_index"] + 1,
+                                                     max=2 * (self.config.chunk_size - 1))  # will need to modify later
+        if "encoded_neighbors" in model_kwargs:
+            encoded_neighbors = model_kwargs["encoded_neighbors"]
+            if encoded_neighbors is not None:
+                model_kwargs["encoded_neighbors"] = EncodedNeighbors(
+                    neighbor_hidden_states=encoded_neighbors.neighbor_hidden_states[-1:, ...],  # assumes bs=1
+                    neighbor_mask=encoded_neighbors.neighbor_mask[-1:, ...],  # assumes bs=1
+                    nei_position_ids=encoded_neighbors.nei_position_ids[-1:, ...],  # assumes bs=1
+                )
+
+        return model_kwargs
