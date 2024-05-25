@@ -1,14 +1,9 @@
 # from more_itertools import windowed, repeat_last
 import numpy as np
-from collections import deque
-from itertools import (
-    chain,
-    repeat,
-)
+
+from more_itertools import windowed
 
 
-
-import time
 def sliding_window(tok_input_ids, width, stride,
                    padding_value=-100,
                    bos_token_id=-2,

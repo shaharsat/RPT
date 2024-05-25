@@ -1,6 +1,13 @@
 import os
 import time
-import sys
+
+import torch
+
+from EasyLM.models.neox.neox_model_torch import GPTNeoXForCausalLM
+from EasyLM.models.neox.rpt_torch_utils import create_prepare_inputs, batch_encode_memories, batch_lookup_neighbors, \
+    add_batch_index, collate_fn
+from EasyLM.models.rpt.torch_utils import reshape_for_vmap
+
 if "DEBUG" in os.environ:
     #   os.system('kill -9 $(lsof -t -i tcp:5678)')
     time.sleep(2)
@@ -9,46 +16,12 @@ if "DEBUG" in os.environ:
     debugpy.listen(5678)
     debugpy.wait_for_client()
 
-
-import pprint
-from functools import partial
-from jax.experimental.multihost_utils import broadcast_one_to_all
 import numpy as np
 
-import flax
-import jax
-import jax.numpy as jnp
-from jax.experimental.pjit import pjit
-from jax.sharding import PartitionSpec as PS
-import optax
-from transformers import GenerationConfig, FlaxLogitsProcessorList
+from transformers import GenerationConfig, LogitsProcessorList, TemperatureLogitsWarper
 import pickle
-from EasyLM.checkpoint import StreamingCheckpointer
-from EasyLM.jax_utils import (
-    JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules, tree_apply,
-    set_random_seed, get_float_dtype_by_name, make_shard_and_gather_fns,
-    with_sharding_constraint, FlaxTemperatureLogitsWarper
-)
 import base64
-from EasyLM.models.neox.neox_model import (
-    GPTNeoXConfig, FlaxGPTNeoXForCausalLMModule,RetrieverSupervision, ranksigrelu, FlaxGPTNeoXForCausalLM
-)
-from flax.training import common_utils
-from EasyLM.jax_utils import reshape_for_vmap
-
-from EasyLM.trainer_utils import parse_overrides
-
-from transformers import AutoTokenizer
-from EasyLM.sliding_window import sliding_window,padded_sliding_window
-from EasyLM.models.neox.neox_model import (
-    GPTNeoXConfig, FlaxGPTNeoXForCausalLMModule,RetrieverSupervision, ranksigrelu, FlaxGPTNeoXForCausalLM
-)
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-
-from EasyLM.models.neox.rpt_utils import batch_lookup_neighbors,add_batch_index,collate_fn,tree_unstack,batch_encode_memories,create_prepare_inputs
 from more_itertools import chunked
-from functools import partial
-from transformers import AutoModel
 
 from dataclasses import dataclass
 
@@ -77,16 +50,9 @@ class Config:
     return_empty: bool
 
 def load_model(config):
-    JaxDistributedConfig.initialize()
-    set_random_seed(config.seed)
-
-    hf_model = FlaxGPTNeoXForCausalLM.from_pretrained('iohadrubin/rpt-2-1.6b_7529ebf46738fdc75e44')
+    hf_model = GPTNeoXForCausalLM.from_pretrained('iohadrubin/rpt-2-1.6b_7529ebf46738fdc75e44')
     prefix_tokenizer = hf_model.config.get_tokenizer(truncation_side='left', padding_side='left')
     tokenizer = hf_model.config.get_tokenizer(truncation_side='right', padding_side='right')
-    params = hf_model.params
-    rng_keys = hf_model.config.rng_keys()
-
-    print('.')
 
     """
     model_cfg = GPTNeoXConfig.load_config(config.model_config_path)
@@ -126,45 +92,43 @@ def load_model(config):
         model_ps, get_float_dtype_by_name(config.dtype)
     )
     """
-    
 
+    def softmax_cross_entropy_with_integer_labels(logits, labels):
+        # This is like jnp.take_along_axis(jax.nn.log_softmax(...), ...) except that
+        # we avoid subtracting the normalizer from all values, just from the values
+        # for the correct labels.
+        logits = torch.max(logits, dim=-1, keepdim=True).values
+        label_logits = torch.take_along_dim(logits, labels[..., None].type(torch.long), dim=-1)[..., 0]
+        log_normalizers = torch.log(torch.sum(torch.exp(logits), dim=-1))
+        return log_normalizers - label_logits
         
 
-    def forward_loglikelihood(params, rng, batch):
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-        rng_generator = JaxRNG(rng)
+    def forward_loglikelihood(hf_model, batch):
         input_tokens = batch['input_tokens']
         output_tokens = batch['output_tokens']
         input_mask = batch['input_mask']
         output_mask = batch['output_mask']
 
-        logits = hf_model.module.apply(
-            dict(params=params), input_tokens, attention_mask=input_mask,
-            deterministic=True, rngs=rng_generator(rng_keys),
-        ).logits
-        loglikelihood = -optax.softmax_cross_entropy_with_integer_labels(
+        logits = hf_model(input_tokens, attention_mask=input_mask, deterministic=True).logits
+        loglikelihood = -softmax_cross_entropy_with_integer_labels(
             logits, output_tokens
         )
-        loglikelihood = jnp.sum(loglikelihood * output_mask, axis=-1)
-        match_count = jnp.sum(
-            (jnp.argmax(logits, axis=-1) == output_tokens) * output_mask,
-            axis=-1
+        loglikelihood = torch.sum(loglikelihood * output_mask, dim=-1)
+        match_count = torch.sum(
+            (torch.argmax(logits, dim=-1) == output_tokens) * output_mask,
+            dim=-1
         )
-        total = jnp.sum(output_mask, axis=-1)
+        total = torch.sum(output_mask, dim=-1)
         is_greedy = match_count == total
-        return loglikelihood, is_greedy, rng_generator()
+        return loglikelihood, is_greedy
 
 
-    def forward_generate(params, rng, batch, temperature):
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-        rng_generator = JaxRNG(rng)
+    def forward_generate(hf_model, batch, temperature):
         output = hf_model.generate(
             batch['input_tokens'],
             attention_mask=batch['attention_mask'],
-            params=params,
-            prng_key=rng_generator(),
-            logits_processor=FlaxLogitsProcessorList(
-                [FlaxTemperatureLogitsWarper(temperature)]
+            logits_processor=LogitsProcessorList(
+                [TemperatureLogitsWarper(temperature)]
             ),
             generation_config=GenerationConfig(
                 max_new_tokens=config.seq_length - config.input_length,
@@ -177,18 +141,13 @@ def load_model(config):
                 top_p=config.top_p,
             )
         ).sequences[:, batch['input_tokens'].shape[1]:]
-        return output, rng_generator()
+        return output
 
 
-    def forward_greedy_generate(params, rng, batch):
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-        rng_generator = JaxRNG(rng)
-        print(jax.tree_map(lambda x: x.shape, batch))
+    def forward_greedy_generate(hf_model, batch):
         output = hf_model.generate(
             batch['input_tokens'],
             attention_mask=batch['attention_mask'],
-            params=params,
-            prng_key=rng_generator(),
             generation_config=GenerationConfig(
                 max_new_tokens=config.seq_length - config.input_length,
                 pad_token_id=tokenizer.eos_token_id,
@@ -198,42 +157,33 @@ def load_model(config):
                 num_beams=1,
             )
         ).sequences[:, batch['input_tokens'].shape[1]:]
-        return output, rng_generator()
+        return output
     
 
-    def create_lowcoder_forward():
-        def apply_forward(params, batch):
-            return hf_model.batch_lowcoder_forward(batch["input_ids"], batch["attention_mask"],params=params)
-        def forward(input_ids,attention_mask,params):
-            batch = {"input_ids": input_ids, "attention_mask": attention_mask}
-            output = apply_forward(params, batch)
-            return output
-
-        forward = flax.jax_utils.pad_shard_unpad(forward, static_argnums=(2,), static_argnames=("params",))
-        return forward
+    def lowcoder_forward(hf_model, input_ids, attention_mask):
+        batch = {"input_ids": input_ids, "attention_mask": attention_mask}
+        output = hf_model.batch_lowcoder_forward(batch["input_ids"], batch["attention_mask"])
+        return output
 
 
 
     def create_greedy():
-        def apply_forward(params, batch):
-            batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        def apply_forward(hf_model, batch):
             def fwd(input_ids, attention_mask, encoded_neighbors):
                 return hf_model.generate(input_ids,max_length=config.seq_length,
-                        params=params,
                         do_sample=False,
                         pad_token_id=0,
                         encoded_neighbors=encoded_neighbors,
                         attention_mask=attention_mask,
                         )
-            fwd = jax.vmap(fwd,in_axes=(0,0,0))
-            batch = jax.tree_map(reshape_for_vmap, batch)
+            fwd = torch.vmap(fwd, in_dims=(0,0,0))
+            batch = reshape_for_vmap(batch)
             result = fwd(batch["input_ids"], batch["attention_mask"], batch["encoded_neighbors"])
             return result
         def forward(input_ids, attention_mask, params, encoded_neighbors):
-            
             batch = {"input_ids": input_ids, "encoded_neighbors":encoded_neighbors, "attention_mask": attention_mask}
             output = apply_forward(params, batch)
-            output = jax.device_get(output)
+            # TODO: torch to device
             assert len(output.shape)==3
             assert output.shape[1]==1
             output = output.squeeze(1)
@@ -247,17 +197,11 @@ def load_model(config):
             
         return forward
 
-    sharded_rng = next_rng()
-        
     greedy_w_cache = create_greedy()
-    lowcoder_forward = create_lowcoder_forward()
     prepare_inputs = create_prepare_inputs(prefix_tokenizer, input_length=config.input_length)
-    # params = dict(params=params)
-    # lowcoder_forward = partial(lowcoder_forward,params=params)
 
 
     def _loglikelihood(prefix_text, text):
-        nonlocal sharded_rng
         prefix = prefix_tokenizer(
             prefix_text,
             padding='max_length',
@@ -295,13 +239,12 @@ def load_model(config):
             input_mask=input_mask,
             output_mask=output_mask,
         )
-        loglikelihood, is_greedy, sharded_rng = forward_loglikelihood(params, sharded_rng, batch)
-        loglikelihood, is_greedy = jax.device_get((loglikelihood, is_greedy))
+        loglikelihood, is_greedy = forward_loglikelihood(hf_model, batch)
+        # TODO: Move to torch device
         return loglikelihood, is_greedy
 
 
     def _loglikelihood_rolling(text):
-        
         inputs = tokenizer(
             text,
             padding='longest',
@@ -356,10 +299,8 @@ def load_model(config):
                     output_mask=attention_mask[:, i:i + config.seq_length],
                 )
 
-            loglikelihood, is_greedy, sharded_rng = forward_loglikelihood(
-                params, sharded_rng, batch
-            )
-            loglikelihood, is_greedy = jax.device_get((loglikelihood, is_greedy))
+            loglikelihood, is_greedy = forward_loglikelihood(hf_model, batch)
+            # TODO: torch to device
 
             total_loglikelihood += loglikelihood
             total_is_greedy = np.logical_and(is_greedy, total_is_greedy)
@@ -368,7 +309,6 @@ def load_model(config):
 
 
     def _generate(text, temperature):
-        nonlocal sharded_rng
         if config.return_empty:
             return ["" for _ in text]
         
@@ -392,9 +332,9 @@ def load_model(config):
         )
         print(batch)
         output, sharded_rng = forward_generate(
-            params, sharded_rng, batch, temperature
+            hf_model, batch, temperature
         )
-        output = jax.device_get(output)
+        # TODO: to torch device
         output_text = []
         for text in list(tokenizer.batch_decode(output)):
             if tokenizer.eos_token in text:
@@ -450,10 +390,10 @@ def load_model(config):
 
                 # print(batch)
                 output, sharded_rng = forward_greedy_generate(
-                   params, sharded_rng, batch
+                   hf_model, sharded_rng, batch
                 )
                 # print(output)
-                output = jax.device_get(output)
+                # TODO: to torch device
                 # print(output)
 
                 total_length += output.shape[1]
@@ -479,8 +419,8 @@ def load_model(config):
         if config.return_empty:
             return ["" for _ in prefix_text]
         
-        num_neighbors  = config.num_neighbors
-        split_by_newline= config.split_by_newline
+        num_neighbors = config.num_neighbors
+        split_by_newline = config.split_by_newline
         # if False:
         #     num_neighbors = 2
         #     split_by_newline=True
@@ -488,22 +428,21 @@ def load_model(config):
         # else:
         #     num_neighbors = 0
             
-        disable_neighbors = config.num_neighbors==0
+        disable_neighbors = config.num_neighbors == 0
         inputs = [prepare_inputs(prefix, split_by_newline) for prefix in prefix_text]
         if pre_compile:
             inputs = [[x[0],x[0]] for x in inputs]
-            
-            
+
         if disable_neighbors:
             input_ids=np.array([x[-1]["input_ids"].squeeze() for x in inputs])
             attention_mask=np.array([x[-1]["attention_mask"].squeeze() for x in inputs])
             encoded_neighbors=None
         else:
-            input_ids, attention_mask, memories, _ = batch_encode_memories((lowcoder_forward,hf_model), inputs, config.lowcoder_batch_size)
-            encoded_output = lowcoder_forward(input_ids,attention_mask,params=params)
+            input_ids, attention_mask, memories, _ = batch_encode_memories((lowcoder_forward, hf_model), inputs, config.lowcoder_batch_size)
+            encoded_output = lowcoder_forward(hf_model, input_ids, attention_mask)
             encoded_neighbors = batch_lookup_neighbors(encoded_output.query_chunks, memories, num_neighbors, config.append_next_chunk)
             # encoded_neighbors = jax.tree.map(lambda x:x[None,:], encoded_neighbors)
-        return greedy_w_cache(input_ids, attention_mask, params, encoded_neighbors)
+        return greedy_w_cache(input_ids, attention_mask, hf_model, encoded_neighbors)
 
     
 
@@ -526,10 +465,10 @@ def load_model(config):
         output_dict = {}
         for batch in chunked(inputs, lowcoder_bs):
             input_ids, attention_mask = collate_fn(batch)
-            encoded_output = lowcoder_forward(input_ids, attention_mask, params=params,
-                                                min_device_batch=max(lowcoder_bs//jax.local_device_count(),1))
-            encoded_output = jax.device_get(encoded_output)
-            encoded_output = tree_unstack(encoded_output)
+            encoded_output = lowcoder_forward(hf_model, input_ids, attention_mask,) # TODO: Handle multi device: min_device_batch=max(lowcoder_bs//jax.local_device_count(),1))
+            # TODO: Torch to device
+            #encoded_output = tree_unstack(encoded_output)
+            # TODO: Handle tree unpacking from torch
             for batch_el, enc in zip(batch, encoded_output):
                 enc = dict(enc)
                 enc["input_ids"] = batch_el["input_ids"]
@@ -548,11 +487,6 @@ def load_model(config):
         encoded_output = [base64.b64encode(enc).decode() for enc in encoded_output]
         return encoded_output
 
-
-
-    
-    
-    
     return _loglikelihood, _loglikelihood_rolling, _generate, _greedy_until, _encode, _old_greedy_until
 
 

@@ -33,7 +33,7 @@ def add_batch_index(x,j):
         el["window_index"]=window_index
     return x
 
-def collate_fn(batch):    
+def collate_fn(batch):
     input_ids = np.array([x["input_ids"].squeeze() for x in batch])
     attention_mask = np.array([x["attention_mask"].squeeze() for x in batch])
     return input_ids, attention_mask
@@ -156,7 +156,7 @@ def create_prepare_inputs(prefix_tokenizer, input_length):
 
 
 def encode_memories(enc_func, windows, batch_size):
-    lowcoder_forward, params = enc_func
+    lowcoder_forward, hf_model = enc_func
     min_device_batch = max(batch_size//jax.local_device_count(),1)
     memories = []
     window_list = []
@@ -173,7 +173,7 @@ def encode_memories(enc_func, windows, batch_size):
 
     for j,(win,(input_ids,attention_mask)) in enumerate(tqdm.tqdm(windows)):
         if (j<len(windows)-1):
-            encoded_output = lowcoder_forward(input_ids,attention_mask,params=params,min_device_batch=min_device_batch)
+            encoded_output = lowcoder_forward(hf_model,input_ids,attention_mask,min_device_batch=min_device_batch)
             memories.append(encoded_output)
         window_list.extend(win)
 

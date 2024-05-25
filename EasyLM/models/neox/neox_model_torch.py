@@ -40,7 +40,7 @@ from transformers.utils import logging
 
 from EasyLM.models.neox.attention_torch import my_dot_product_attention_weights
 from EasyLM.models.neox.gate_torch import GriffinGate
-from EasyLM.models.rpt.rpt_torch_utils import EncodedNeighbors, new_lookup_neighbors, GPTNeoXRetrieverNeighborOutput, \
+from EasyLM.models.neox.rpt_torch_utils import EncodedNeighbors, new_lookup_neighbors, GPTNeoXRetrieverNeighborOutput, \
     GPTNeoXRetrieverEncodedOutput, GPTNeoXLMOutput
 from EasyLM.torch_utils import make_causal_mask, assign_slice, combine_masks
 
