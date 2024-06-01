@@ -2606,7 +2606,8 @@ class GPTNeoXForCausalLMModule(GPTNeoXPreTrainedModel):
 
         with torch.no_grad():
             outputs = []
-            for batch in chunked(inputs, batch_size):
+            for i, batch in enumerate(chunked(inputs, batch_size)):
+                print(f'{batch[-1]["batch_index"]+1}/{len(inputs)}')
                 input_ids, attention_mask = collate_fn(batch)
                 encoded_output = self.batch_lowcoder_forward(input_ids, attention_mask)
                 for key in encoded_output['key_chunks']:
