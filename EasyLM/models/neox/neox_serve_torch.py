@@ -1,8 +1,11 @@
 import os
 import time
 
+import flax
 import torch
+import transformers
 
+from EasyLM.models.neox.neox_model import FlaxGPTNeoXForCausalLM
 from EasyLM.models.neox.neox_model_torch import GPTNeoXForCausalLM
 from EasyLM.models.neox.rpt_torch_utils import create_prepare_inputs, batch_encode_memories, batch_lookup_neighbors, \
     add_batch_index, collate_fn
@@ -50,7 +53,8 @@ class Config:
     return_empty: bool
 
 def load_model(config):
-    hf_model = GPTNeoXForCausalLM.from_pretrained('iohadrubin/rpt-2-1.6b_7529ebf46738fdc75e44')
+    hf_model = GPTNeoXForCausalLM.from_pretrained(pretrained_model_name_or_path='/Users/shahar.satamkar/Desktop/Masters/RPT/EasyLM/models/neox/neox_model_torch')
+
     prefix_tokenizer = hf_model.config.get_tokenizer(truncation_side='left', padding_side='left')
     tokenizer = hf_model.config.get_tokenizer(truncation_side='right', padding_side='right')
 
@@ -160,10 +164,8 @@ def load_model(config):
         return output
     
 
-    def lowcoder_forward(hf_model, input_ids, attention_mask):
-        batch = {"input_ids": input_ids, "attention_mask": attention_mask}
-        output = hf_model.batch_lowcoder_forward(batch["input_ids"], batch["attention_mask"])
-        return output
+    def lowcoder_forward(hf_model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+        return hf_model.batch_lowcoder_forward(input_ids, attention_mask)
 
 
 
@@ -465,7 +467,11 @@ def load_model(config):
         output_dict = {}
         for batch in chunked(inputs, lowcoder_bs):
             input_ids, attention_mask = collate_fn(batch)
-            encoded_output = lowcoder_forward(hf_model, input_ids, attention_mask,) # TODO: Handle multi device: min_device_batch=max(lowcoder_bs//jax.local_device_count(),1))
+            encoded_output = []
+            for input_id, attention_mask_id in zip(input_ids, attention_mask):
+                single_encoded_output = lowcoder_forward(hf_model, input_id.unsqueeze(0), attention_mask_id.unsqueeze(0)) # TODO: Handle multi device: min_device_batch=max(lowcoder_bs//jax.local_device_count(),1))
+                encoded_output.append(single_encoded_output)
+
             # TODO: Torch to device
             #encoded_output = tree_unstack(encoded_output)
             # TODO: Handle tree unpacking from torch

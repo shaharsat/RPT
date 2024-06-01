@@ -431,9 +431,7 @@ class RPTConfig(PretrainedConfig):
         self.gated_ff = gated_ff
         self.mult_in_complex = mult_in_complex
         self.use_cca_norm2 = use_cca_norm2
-        
-        
-        
+
         if num_sequence_chunks is not None:
             self.num_sequence_chunks = num_sequence_chunks
         elif max_sequence_length is not None and chunk_size is not None:

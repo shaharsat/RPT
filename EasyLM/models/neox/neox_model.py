@@ -27,7 +27,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ GPTNeoX model configuration"""
-
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
@@ -797,14 +796,23 @@ class FlaxGPTNeoXAttention(nn.Module):
         # qkv = self.query_key_value(hidden_states)
 
         # proj q, k, v
+        jax.debug.print('1: hidden_states={x}', x=hidden_states)
         fused_qkv = self.query_key_value(hidden_states)
+        jax.debug.print('2: fused_qkv={x}', x=fused_qkv)
         batch, seq_len, _ = fused_qkv.shape
         fused_qkv = self._split_heads(fused_qkv)
+        jax.debug.print('3: fused_qkv={x}', x=fused_qkv)
         query, key, value = jnp.split(fused_qkv, 3, axis=-1)
+        jax.debug.print('4: query={x}', x=query)
+        jax.debug.print('4: key={x}', x=key)
+        jax.debug.print('4: value={x}', x=value)
         # key = with_sharding_constraint(key, PS(("dp", "fsdp"), None, "mp"))
         # value = with_sharding_constraint(value, PS(("dp", "fsdp"), None, "mp"))
 
         cos, sin = self.rotary_emb(seq_len)
+
+        jax.debug.print('5: cos={x}', x=cos)
+        jax.debug.print('5: sin={x}', x=sin)
         if self.rotary_ndims is not None:
             k_rot = key[..., : self.rotary_ndims]
             k_pass = key[..., self.rotary_ndims :]
@@ -812,10 +820,22 @@ class FlaxGPTNeoXAttention(nn.Module):
             q_rot = query[..., : self.rotary_ndims]
             q_pass = query[..., self.rotary_ndims :]
 
+            jax.debug.print('6: k_rot={x}', x=k_rot)
+            jax.debug.print('6: k_pass={x}', x=k_pass)
+
+            jax.debug.print('6: q_rot={x}', x=q_rot)
+            jax.debug.print('6: q_pass={x}', x=q_pass)
+
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin, position_ids)
+
+            jax.debug.print('7: q_rot={x}', x=q_rot)
+            jax.debug.print('7: q_pass={x}', x=q_pass)
 
             key = jnp.concatenate([k_rot, k_pass], axis=-1)
             query = jnp.concatenate([q_rot, q_pass], axis=-1)
+
+            jax.debug.print('8: key={x}', x=key)
+            jax.debug.print('8: query={x}', x=query)
         else:
             query, key = apply_rotary_pos_emb(query, key, cos, sin, position_ids)
         query = query.astype(self.dtype)
@@ -854,6 +874,11 @@ class FlaxGPTNeoXAttention(nn.Module):
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
             jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
         )
+
+        jax.debug.print('9: query={x}', x=query)
+        jax.debug.print('9: key={x}', x=key)
+        jax.debug.print('9: attention_bias={x}', x=attention_bias)
+
         # if False:
         attn_weights = my_dot_product_attention_weights(
             query,
@@ -866,6 +891,9 @@ class FlaxGPTNeoXAttention(nn.Module):
             precision=None,
             apply_tanh=self.config.tanh_causal_att,
         )
+
+        jax.debug.print('10: attn_weights={x}', x=attn_weights)
+
         # print()
         # attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
         attn_weights = attn_weights.astype(self.dtype)
@@ -884,7 +912,7 @@ class FlaxGPTNeoXAttention(nn.Module):
         #         float32_logits=True
         #     ).astype(self.dtype)
         #     attn_weights = None
-        
+
         attn_output = self._merge_heads(attn_output)
         attn_output = self.dense(attn_output).astype(self.dtype)
 
@@ -997,7 +1025,7 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
             kernel_init=kernel_init,
             precision=self.precision,
         )
-        
+
         self.wo = nn.Dense(
             config.hidden_size,
             dtype=self.dtype,
@@ -1007,7 +1035,7 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
             precision=self.precision,
         )
 
-            
+
         self.freqs_cis = precompute_freqs_cis(
             self.head_dim,
             config.max_position_embeddings * 2,
@@ -1017,17 +1045,17 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
         if self.qk_layernorm:
             self.q_layernorm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
             self.k_layernorm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
-            
-        
-        
+
+
+
 
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
-    
+
 
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
-    
+
     @nn.compact
     def _concatenate_to_cache(self, key, value, attention_mask):
         """
@@ -1050,7 +1078,7 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
             # cache_index.value = cache_index.value + 1
 
         return key, value, attention_mask
-        
+
     def __call__(
         self,
         hidden_states: jnp.ndarray,
@@ -1063,15 +1091,15 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
         deterministic: bool = True,
     ) -> Tuple[jnp.ndarray]:
         #TODO: add init_cca_cache and a _concatenate_to_cache function and document this...
-        
+
         is_cross_attention = key_value_states is not None
-        
-        
+
+
 
         xq = self.wq(hidden_states)
         xq = self._split_heads(xq).astype(self.dtype)
         xq = self.q_layernorm(xq) if self.qk_layernorm else xq
-        
+
         if not is_cross_attention:
             key_value_states = hidden_states
         # if is_init and use_cca_cache:
@@ -1084,25 +1112,25 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
         xk = self.wk(key_value_states)
         xk = self._split_heads(xk).astype(self.dtype)
         xk = self.k_layernorm(xk) if self.qk_layernorm else xk
-        
+
         xv = self.wv(key_value_states)
         xv = self._split_heads(xv).astype(self.dtype)
 
 
-            
-             
+
+
         null_k = self.k_layernorm(self.null_k) if self.qk_layernorm else self.null_k
-        
-        
+
+
 
         query_length, key_length = xq.shape[1], xk.shape[1]
         batch_size = hidden_states.shape[0]
         print(f"{xq.shape=}, {xk.shape=}, {self.has_variable('cache', 'cached_key')=}")
-            
+
         if position_ids is None:
             position_ids = jnp.arange(query_length, dtype=jnp.int32)
             position_ids = jnp.broadcast_to(position_ids[None, :], (batch_size, query_length))
-            
+
         freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
         if not is_cross_attention:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype, rot_dim=self.head_dim)
@@ -1117,10 +1145,10 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
         xk = jnp.concatenate((xk, null_k), axis = -3)
         null_v = jnp.broadcast_to(self.null_v, (batch_size, 1, self.num_heads, self.head_dim)).astype(self.dtype)
         xv = jnp.concatenate((xv, null_v), axis = -3)
-        
-                
+
+
         if attention_mask is not None:
-            
+
             null_mask = jnp.ones((attention_mask.shape[0], 1), dtype=jnp.float32)
             attention_mask = jnp.concatenate((attention_mask, null_mask), axis = -1)
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
@@ -1130,15 +1158,15 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
                 null_ret_score = jnp.zeros((retriever_scores.shape[0], 1), dtype=jnp.float32)
                 attention_bias = jnp.concatenate((retriever_scores, null_ret_score), axis = -1)
                 attention_bias = jnp.expand_dims(attention_bias, axis=(-3, -2))
-                    
-                
+
+
             attention_bias = lax.select(
                 attention_mask > 0,
                 attention_bias.astype(self.dtype),
                 jnp.full(attention_bias.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
             if xq.shape[0]!=attention_bias.shape[0]:
-              attention_bias = attention_bias[:batch_size,...]  
+              attention_bias = attention_bias[:batch_size,...]
 
         else:
             attention_bias = None
@@ -1147,7 +1175,7 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
         if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-        
+
         attn_weights = my_dot_product_attention_weights(
             xq,
             xk,
@@ -1165,10 +1193,10 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
         attn_output = self.wo(attn_output).astype(self.dtype)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
         return outputs
-    
-    
-    
-        
+
+
+
+
 class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype=jnp.float32
@@ -1195,7 +1223,7 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
     ):
         if not self.config.ret_score_in_cca:
              att_scores=None
-             
+
         if self.config.apply_refactor:
             func = self.new_call
         else:
@@ -1203,7 +1231,7 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
         func = jax.vmap(func,
                 in_axes=(0, 0, 0, 0, 0 if att_scores is  not None else None,
                         0 if position_ids is  not None else None, None, None, None, None),
-                out_axes=0,   
+                out_axes=0,
                 # variable_axes={'params': None, 'intermediates': 0},
                 # split_rngs={'dropout': True, "params": False},
             )
@@ -1225,7 +1253,7 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
         num_neighbors = self.config.num_neighbors
         if chunk_size is None:
             chunk_size = self.config.chunk_size
-            
+
         causal_padding = chunk_size - 1
         num_devices, seq_len, hidden_dim = hidden_states.shape
         print(f"{neighbor_hidden_states=}")
@@ -1233,12 +1261,12 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
         neighbor_hidden_states = neighbor_hidden_states.reshape([-1, 2*chunk_size*num_neighbors, hidden_dim])
         num_document_chunks = neighbor_hidden_states.shape[0]
         nei_position_ids = nei_position_ids.reshape([-1, 2*chunk_size*num_neighbors])
-        
-        
-        
+
+
+
         neighbor_mask = neighbor_mask.reshape([-1, 2*chunk_size*num_neighbors])
         # num_document_chunks, num_neighbors, _, _ = neighbor_hidden_states.shape
-        
+
         # -> (-1, num_devices_chunks, num_neighbors, 2*chunk_size, hidden_dim)
         if att_scores is not None:
             att_scores = jnp.broadcast_to(att_scores[...,None], att_scores.shape+(2*chunk_size,)).reshape([-1, 2*chunk_size*num_neighbors])
@@ -1249,17 +1277,17 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
             hidden_states = hidden_states.reshape([-1, num_devices_chunks*chunk_size, hidden_dim])
             hidden_states = jnp.pad(hidden_states[:,causal_padding:,:], ((0,0),(0, causal_padding),(0,0)), 'constant')
             hidden_states = hidden_states.reshape([-1,chunk_size, hidden_dim])
-            
+
             position_ids = jnp.arange(chunk_size)+chunk_size-1
             position_ids = jnp.broadcast_to(position_ids[None, :], (hidden_states.shape[0], chunk_size))
         else:
             hidden_states = hidden_states.reshape([1,1, hidden_dim])
             assert position_ids is not None
 
-            
-        
 
-        
+
+
+
         # cross attention
         output = self.cross_attention(
                     hidden_states=hidden_states,
@@ -1271,16 +1299,16 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
                     output_attentions=output_attentions,
                     deterministic=deterministic,
                     )
-        
+
         # reshape back to original sequence
         cross_attention_out = output[0]
         if num_document_chunks>1:
             cross_attention_out = cross_attention_out.reshape([-1, num_devices_chunks*chunk_size, hidden_dim])
             # # pad back to original, with 0s at the beginning (which will be added to the residual and be fine)
             cross_attention_out = jnp.pad(cross_attention_out, ((0,0),(causal_padding, 0),(0,0)), 'constant')[:,:-causal_padding]
-        cross_attention_out = cross_attention_out.reshape([num_devices, seq_len, hidden_dim])        
+        cross_attention_out = cross_attention_out.reshape([num_devices, seq_len, hidden_dim])
         return (cross_attention_out,)+output[1:]
-    
+
 
     def new_call(
         self,
@@ -1294,8 +1322,8 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
         deterministic:bool=True,
         chunk_size:Optional[int]=None,
         n_chunks_per_window:Optional[int]=None,
-    ): 
-        
+    ):
+
         batch_size, seq_len, hidden_dim = hidden_states.shape
         if chunk_size is None:
             chunk_size = self.chunk_size
@@ -1308,14 +1336,14 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
         neighbor_hidden_states = rearrange(neighbor_hidden_states, 'b k r d-> b (k r) d')
         if att_scores is not None:
             att_scores = rearrange(att_scores, 'b k r -> b (k r)')
-        
-        
-        # TODO: remove this 
+
+
+        # TODO: remove this
         nei_position_ids = jnp.clip(nei_position_ids, a_min=0, a_max=2*self.config.chunk_size-1)
 
-        
+
         # -> (-1, n_chunks_per_window, num_neighbors, 2*chunk_size, hidden_dim)
-        if not is_generating: 
+        if not is_generating:
             if n_chunks_per_window is None:
                 # n_chunks_per_window = seq_len//chunk_size
                 n_chunks_per_window = num_document_chunks//hidden_states.shape[0]
@@ -1323,13 +1351,13 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
             hidden_states = hidden_states.reshape([-1, n_chunks_per_window*chunk_size, hidden_dim])
             hidden_states = jnp.pad(hidden_states[:,causal_padding:,:], ((0,0),(0, causal_padding),(0,0)), 'constant')
             hidden_states = hidden_states.reshape([-1, chunk_size, hidden_dim])
-            
+
             position_ids = jnp.arange(chunk_size)+chunk_size-1
             position_ids = jnp.broadcast_to(position_ids, hidden_states.shape[:2])
         else:
             hidden_states = hidden_states.reshape([1,1, hidden_dim])
 
-        
+
         # cross attention
         output = self.cross_attention(
                     hidden_states=hidden_states,
@@ -1341,16 +1369,16 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
                     output_attentions=output_attentions,
                     deterministic=deterministic,
                     )
-        
+
         # reshape back to original sequence
         cross_attention_out = output[0]
         if not is_generating:
             cross_attention_out = cross_attention_out.reshape([-1, n_chunks_per_window*chunk_size, hidden_dim])
             # # pad back to original, with 0s at the beginning (which will be added to the residual and be fine)
             cross_attention_out = jnp.pad(cross_attention_out, ((0,0),(causal_padding, 0),(0,0)), 'constant')[:,:-causal_padding]
-        cross_attention_out = cross_attention_out.reshape([batch_size, seq_len, hidden_dim])                
+        cross_attention_out = cross_attention_out.reshape([batch_size, seq_len, hidden_dim])
         return (cross_attention_out,)+output[1:]
-    
+
 class FlaxGPTNeoXMLP(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
@@ -1363,7 +1391,7 @@ class FlaxGPTNeoXMLP(nn.Module):
             intermediate_size = self.config.intermediate_size
         else:
             intermediate_size = self.intermediate_size
-            
+
         kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
 
         self.dense_h_to_4h = nn.Dense(intermediate_size, dtype=self.dtype, kernel_init=kernel_init, param_dtype=self.param_dtype)
@@ -1410,13 +1438,13 @@ class FlaxGPTNeoXBlock(nn.Module):
             self.cca_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
                                          dtype=self.dtype,
                                          scale_init=jax.nn.initializers.constant(self.config.cca_layernorm_init_scale),)
-                                             
-                
+
+
         else:
             self.cca = None
             self.cca_norm = None
 
-            
+
 
     def __call__(
         self,
@@ -1434,9 +1462,9 @@ class FlaxGPTNeoXBlock(nn.Module):
         cca_kwargs: Optional[Dict] = None,
         # use_cca_cache:bool=False,
     ):
-        # hidden_states = with_sharding_constraint(hidden_states, PS(("dp", "fsdp"), None, "mp"))      
-        print(f"{hidden_states=}",flush=True) 
-        if self.cca is not None and (neighbor_hidden_states is not None):     
+        # hidden_states = with_sharding_constraint(hidden_states, PS(("dp", "fsdp"), None, "mp"))
+        print(f"{hidden_states=}",flush=True)
+        if self.cca is not None and (neighbor_hidden_states is not None):
             cca_output = self.cca(hidden_states=self.cca_norm(hidden_states),
                                      neighbor_hidden_states=neighbor_hidden_states,
                                      neighbor_mask=neighbor_mask,
@@ -1446,8 +1474,8 @@ class FlaxGPTNeoXBlock(nn.Module):
                                      output_attentions=output_attentions,
                                      deterministic=deterministic,
                                      **(cca_kwargs if cca_kwargs is not None else dict())
-                                     
-                ) 
+
+                )
             cca_hidden_states = cca_output[0]
             if self.config.apply_tanh_in_cca:
                 cca_hidden_states = (30*jax.nn.tanh(cca_hidden_states/30)).astype(cca_hidden_states.dtype)
@@ -1455,11 +1483,15 @@ class FlaxGPTNeoXBlock(nn.Module):
                 hidden_states = cca_hidden_states + hidden_states
         else:
             cca_hidden_states = None
+
+
+        jax.debug.print('sum={x}', x=jnp.sum(hidden_states))
         att_input = self.input_layernorm(hidden_states).astype(self.dtype)
-        print(f"{att_input=}",flush=True)
+        jax.debug.print('att_input={x}', x=att_input)
+        #print(f"{att_input=}",flush=True)
         # att_input = with_sharding_constraint(att_input, PS(("dp", "fsdp"), None, "mp"))
         # attention_mask = with_sharding_constraint(attention_mask, PS(("dp", "fsdp"), None))
-        
+
         attn_outputs = self.attention(
             att_input,
             attention_mask,
@@ -1472,7 +1504,7 @@ class FlaxGPTNeoXBlock(nn.Module):
         attn_output = self.post_attention_dropout(attn_output, deterministic=deterministic)
         # attn_output = with_sharding_constraint(attn_output, PS(("dp", "fsdp"), None, "mp"))
 
-            
+
 
         if self.use_parallel_residual:
             # pseudocode:
@@ -1484,7 +1516,7 @@ class FlaxGPTNeoXBlock(nn.Module):
                 hidden_states = mlp_output + attn_output + hidden_states
             else:
                 if self.config.log_debug_metrics and not self.is_initializing():
-                    # TODO: 
+                    # TODO:
                     cca_hidden_states_norm = jax.numpy.linalg.norm(cca_hidden_states, axis=-1).mean(where=attention_mask>0)
                     att_hidden_states_norm = jax.numpy.linalg.norm(attn_output, axis=-1).mean(where=attention_mask>0)
                     mlp_hidden_states_norm = jax.numpy.linalg.norm(mlp_output, axis=-1).mean(where=attention_mask>0)
@@ -1501,7 +1533,7 @@ class FlaxGPTNeoXBlock(nn.Module):
             # pseudocode:
             # x = x + attn(ln1(x))
             # x = x + mlp(ln2(x))
-            
+
             attn_output = attn_output + hidden_states
             mlp_output = self.mlp(self.post_attention_layernorm(attn_output))
             mlp_output = self.post_mlp_dropout(mlp_output, deterministic=deterministic)
@@ -1762,18 +1794,18 @@ class FlaxGPTNeoXPreTrainedModel(FlaxPreTrainedModel):
             state = self._run_loop_in_debug(sample_search_cond_fn, sample_search_body_fn, state)
         else:
             state = lax.while_loop(sample_search_cond_fn, sample_search_body_fn, state)
-            
+
         past_key_values = state.model_kwargs['past_key_values']
         last_lowcoder_states = past_key_values['transformer']['cached_array']
-        
+
         encoded_lowcoder_states = self.preret_forward(
                            hidden_states=last_lowcoder_states,
                            attention_mask = jnp.ones(last_lowcoder_states.shape[:-1]),
                            params=params)
-        
+
         return state, encoded_lowcoder_states
-    
-    
+
+
     def _greedy_search(
         self,
         input_ids: None,
@@ -1840,7 +1872,7 @@ class FlaxGPTNeoXPreTrainedModel(FlaxPreTrainedModel):
 
             next_token = next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
             # next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
-            next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id) | jnp.isin(next_token,end_seq) 
+            next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id) | jnp.isin(next_token,end_seq)
             next_token = next_token[:, None]
 
             next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
@@ -1863,7 +1895,7 @@ class FlaxGPTNeoXPreTrainedModel(FlaxPreTrainedModel):
             state = lax.while_loop(greedy_search_cond_fn, greedy_search_body_fn, state)
 
         return state.sequences
-    
+
     def single_lowcoder_forward(
             self,
             input_ids,
@@ -1887,10 +1919,10 @@ class FlaxGPTNeoXPreTrainedModel(FlaxPreTrainedModel):
                 deterministic=not train,
                 output_attentions=output_attentions,
                 method=self.module._lowcoder_forward,
-                **apply_kwargs       
+                **apply_kwargs
         )
         return outputs
-    
+
     # def batch_lowcoder_forward(self, input_ids, attention_mask, params):
     def batch_lowcoder_forward(self,
             input_ids,
@@ -1903,7 +1935,7 @@ class FlaxGPTNeoXPreTrainedModel(FlaxPreTrainedModel):
             output_attentions:bool = False,
             dropout_rng = None,
             ):
-        
+
         input_ids = with_sharding_constraint(input_ids, PS(('dp', 'fsdp')))
         attention_mask = with_sharding_constraint(attention_mask, PS(('dp', 'fsdp')))
         apply_kwargs = self.create_apply_kwargs(params, dropout_rng, past_key_values)
@@ -1915,7 +1947,7 @@ class FlaxGPTNeoXPreTrainedModel(FlaxPreTrainedModel):
                 deterministic=not train,
                 output_attentions=output_attentions,
                 method=self.module._lowcoder_forward,
-                **apply_kwargs       
+                **apply_kwargs
         )
 
 
@@ -1976,14 +2008,14 @@ class FlaxGPTNeoXBlockCollection(nn.Module):
                                          self.config.cca_freq)
         else:
             self.cca_layer_idxs = set()
-            
+
         self.blocks = [
-            FlaxGPTNeoXBlock(self.config, name=str(i), dtype=self.dtype, param_dtype=self.param_dtype, 
+            FlaxGPTNeoXBlock(self.config, name=str(i), dtype=self.dtype, param_dtype=self.param_dtype,
                              has_cca=i in list(self.cca_layer_idxs),
                              ) for i in range(self.config.num_hidden_layers)
         ]
-    
-                 
+
+
     def __call__(
         self,
         hidden_states,
@@ -2011,7 +2043,7 @@ class FlaxGPTNeoXBlockCollection(nn.Module):
             blocks = [self.blocks[i] for i in self.upcoder_layer_idxs]
         else:
             raise ValueError(f"mode {mode} not recognized")
-        
+
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         all_cross_attentions = () if output_attentions else None
@@ -2050,10 +2082,10 @@ class FlaxGPTNeoXBlockCollection(nn.Module):
             attentions=all_attentions,
             cross_attentions=all_cross_attentions,
         )
-    
-    
+
+
 from collections import namedtuple
-RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])    
+RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])
 
 
 
@@ -2069,7 +2101,7 @@ class FlaxGPTNeoXQueryAugmentorLayer(nn.Module):
         self.nei_att_ln = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
         self.nei_lowrank_mlp = FlaxGPTNeoXMLP(self.config, dtype=self.dtype, param_dtype=self.param_dtype, intermediate_size=self.config.query_aug_dim)
         self.nei_lowrank_mlp_ln = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
-        
+
         self.query_att_ln = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
         if self.config.apply_query_to_nei_att:
             self.query_to_nei_att = FlaxGPTNeoXCrossAttention(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
@@ -2080,8 +2112,8 @@ class FlaxGPTNeoXQueryAugmentorLayer(nn.Module):
             self.query_to_nei_att = None
             self.query_lowrank_mlp = None
             self.query_lowrank_mlp_ln = None
-            
-        
+
+
     def __call__(self,
                  query,
                  query_attention_mask,
@@ -2093,12 +2125,12 @@ class FlaxGPTNeoXQueryAugmentorLayer(nn.Module):
                  ):
         if chunk_size is None:
             chunk_size = self.config.chunk_size
-        
-        
+
+
         original_query,original_nei = query, nei
         query,nei = self.query_att_ln(query), self.nei_att_ln(nei)
         num_document_chunks, num_neighbors, ret_size, hidden_dim = nei.shape
-        
+
         if nei_position_ids is None:
             nei_position_ids = jnp.arange(ret_size)
             nei_position_ids = jnp.broadcast_to(nei_position_ids[None,None, :], (num_document_chunks, num_neighbors, ret_size))
@@ -2124,7 +2156,7 @@ class FlaxGPTNeoXQueryAugmentorLayer(nn.Module):
             else:
                 query_alpha, query_beta = 0,1
             query_gate = query_alpha*original_query + query_beta*aug_query
-                
+
         copied_query = einops.repeat(query, "b c d -> (b k) c d", k=num_neighbors)
         copied_query = with_sharding_constraint(copied_query, PS(("dp", "fsdp"), None, "mp"))
         copied_q_mask = einops.repeat(query_attention_mask, "b c -> (b k) c", k=num_neighbors)
@@ -2143,24 +2175,24 @@ class FlaxGPTNeoXQueryAugmentorLayer(nn.Module):
             nei_alpha, nei_beta = self.nei_gate(aug_nei)
         else:
             nei_alpha, nei_beta = 0, 1
-        nei_gate = nei_alpha*original_nei + nei_beta*aug_nei 
+        nei_gate = nei_alpha*original_nei + nei_beta*aug_nei
         if self.config.apply_query_to_nei_att:
             return query_gate, nei_gate
         else:
             return original_query, nei_gate
-        
-    
+
+
 class FlaxGPTNeoXQueryAugmentor(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     def setup(self):
         self.layers = [FlaxGPTNeoXQueryAugmentorLayer(self.config, dtype=self.dtype, param_dtype=self.param_dtype) for _ in range(self.config.n_query_aug_layers)]
-            
+
     @partial(
         nn.vmap,
         in_axes=(0, 0, 0, 0),
-        out_axes=0,   
+        out_axes=0,
         variable_axes={'params': None, 'intermediates': 0, "cache" : 0},
         split_rngs={'dropout': True, "params": False},
     )
@@ -2177,8 +2209,8 @@ class FlaxGPTNeoXQueryAugmentor(nn.Module):
                             is_last=i==self.config.n_query_aug_layers-1
                             )
 
-  
-            
+
+
         return nei
 
 class FlaxGPTNeoXModule(nn.Module):
@@ -2206,8 +2238,8 @@ class FlaxGPTNeoXModule(nn.Module):
             self.query_augmentor = FlaxGPTNeoXQueryAugmentor(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
         else:
             self.query_augmentor = None
-            
-            
+
+
     def lowcoder(self,
         input_ids,
         attention_mask,
@@ -2220,7 +2252,13 @@ class FlaxGPTNeoXModule(nn.Module):
         # use_cca_cache:bool=False,
         ):
         input_embeds = self.embed_in(input_ids.astype("i4"))
+
+        jax.debug.print('input_embeds={x}', x=input_embeds)
+
         hidden_states = self.emb_dropout(input_embeds, deterministic=deterministic)
+
+        jax.debug.print('emb_dropout={x}', x=hidden_states)
+
         lowcoder_outputs = self.layers(
             hidden_states,
             attention_mask,
@@ -2234,9 +2272,9 @@ class FlaxGPTNeoXModule(nn.Module):
             # use_cca_cache=use_cca_cache,
         )
         return lowcoder_outputs
-        
 
-            
+
+
     # @nn.compact
     # def _concatenate_to_lowcoder_cache(self, array):
     #     chunk_size = self.config.chunk_size
@@ -2248,9 +2286,9 @@ class FlaxGPTNeoXModule(nn.Module):
     #                                  array.dtype)
     #     if is_initialized:
     #         last_chunk = array[...,-chunk_size:,:]
-            
+
     #         num_updated_cache_vectors = last_chunk.shape[-2]
-    #         shift = self.config.chunk_size-num_updated_cache_vectors #will need to update if I change retrieval stride                        
+    #         shift = self.config.chunk_size-num_updated_cache_vectors #will need to update if I change retrieval stride
     #         indices = (0,) * len(batch_dims) + (shift,  0)
 
     #         array_operand = jnp.roll(cached_array.value, shift=-num_updated_cache_vectors, axis=-2)
@@ -2286,7 +2324,7 @@ class FlaxGPTNeoXModule(nn.Module):
         retriever_input = None
         att_scores = None
         cca_kwargs = None
-        
+
         if retrieval_kwargs is None:
             retrieval_kwargs = dict()
         if position_ids is None:
@@ -2305,8 +2343,8 @@ class FlaxGPTNeoXModule(nn.Module):
                                      mode="encoded_output",
                                      )
             assert self.config.pooling_size>0
-            retrieval_kwargs = dict(pooling_size=self.config.pooling_size, 
-                                    append_next_chunk=False, 
+            retrieval_kwargs = dict(pooling_size=self.config.pooling_size,
+                                    append_next_chunk=False,
                                     n_skip_chunks=0,
                                     num_neighbors=retrieval_kwargs.get("num_neighbors",None),
                                     )
@@ -2314,10 +2352,11 @@ class FlaxGPTNeoXModule(nn.Module):
         else:
             lo_encoded_output = None
 
-        
+
         input_embeds = self.embed_in(input_ids.astype("i4"))
         hidden_states = self.emb_dropout(input_embeds, deterministic=deterministic)
-        
+
+        jax.debug.print('emb_dropout: {x}', x=hidden_states)
 
         def lowcoder(hidden_states, attention_mask, position_ids):
             return self.layers(
@@ -2333,10 +2372,10 @@ class FlaxGPTNeoXModule(nn.Module):
             )
         lowcoder_outputs = lowcoder(hidden_states, attention_mask, position_ids)
 
-        hidden_states = lowcoder_outputs.last_hidden_state if  return_dict else lowcoder_outputs[0] 
+        hidden_states = lowcoder_outputs.last_hidden_state if  return_dict else lowcoder_outputs[0]
         # if self.has_variable("cache", "cached_array") or init_cache:
         #     self._concatenate_to_lowcoder_cache(hidden_states)
-            
+
         retriever_input = hidden_states
         if self.retriever is not None and np.prod(hidden_states.shape[:-1])>1:
             if encoded_neighbors is not None:
@@ -2373,10 +2412,10 @@ class FlaxGPTNeoXModule(nn.Module):
                                                 num_neighbors=retrieval_kwargs.get("num_neighbors", None),
                                                 )
                 neighbor_hidden_states = retriever_output.neighbor_hidden_states
-                neighbor_mask = retriever_output.neighbor_mask     
+                neighbor_mask = retriever_output.neighbor_mask
                 att_scores = retriever_output.att_scores
                 nei_position_ids = retriever_output.nei_position_ids
-                
+
         if self.query_augmentor is not None and encoded_output is not None:
             # TODO: add nei_position_ids to this.
             neighbor_hidden_states = self.query_augmentor(encoded_output.encoded_hidden_states,
@@ -2394,11 +2433,11 @@ class FlaxGPTNeoXModule(nn.Module):
                                     chunk_index=chunk_index,
                                     cca_kwargs=cca_kwargs,
                                     mode="upcoder")
-        
-        
-        hidden_states = upcoder_outputs.last_hidden_state if  return_dict else upcoder_outputs[0] 
+
+
+        hidden_states = upcoder_outputs.last_hidden_state if  return_dict else upcoder_outputs[0]
         hidden_states = self.final_layer_norm(hidden_states)
-        
+
 
         if not return_dict:
             return (hidden_states,) + upcoder_outputs + lowcoder_outputs
@@ -2414,7 +2453,7 @@ class FlaxGPTNeoXModule(nn.Module):
             retriever_output=retriever_output,
             retriever_input=retriever_input,
         )
-        
+
 
 @add_start_docstrings(
     "The bare GPTNeoX Model transformer outputting raw hidden-states without any specific head on top.",
@@ -2437,7 +2476,7 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
 
-        
+
     def setup(self):
         self.gpt_neox = FlaxGPTNeoXModule(self.config, dtype=self.dtype,param_dtype=self.param_dtype)
         self.embed_out = nn.Dense(
@@ -2473,7 +2512,7 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
         )
         return outputs
 
-    
+
     def __call__(
         self,
         input_ids,
@@ -2493,12 +2532,12 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
         chunk_index: Optional[jnp.array] = None,
         retrieval_kwargs: Optional[dict] = None,
     ):
-        
+
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
         else:
             assert len(input_ids.shape)==len(attention_mask.shape), "input_ids and attention_mask must have the same number of dimensions"
-            
+
         if position_ids is None:
             position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
@@ -2514,8 +2553,8 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
             if retriever_supervision is not None:
                 retriever_supervision =jax.tree.map(lambda x: x[None,...], retriever_supervision)
             should_squeeze = True
-            
-            
+
+
         transformer_input = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -2529,7 +2568,7 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
             )
         if retriever_supervision is not None:
             transformer_input.update(retriever_supervision=retriever_supervision)
-            
+
         def transformer(**kwargs):
             return self.gpt_neox(
                 deterministic=deterministic,
@@ -2538,23 +2577,23 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-                **kwargs, 
+                **kwargs,
             )
         # if jax.process_count() > 1 and not self.is_initializing():
         #     transformer = jax.vmap(transformer)
         #     outputs = transformer(**transformer_input)
-        #     
+        #
         # else:
         # transformer_input = jax.tree_map(add_process_dim, transformer_input)
         outputs = transformer(**transformer_input)
         # outputs = jax.tree_map(remove_process_dim, outputs)
 
-        hidden_states = outputs.last_hidden_state if return_dict else outputs[0] 
+        hidden_states = outputs.last_hidden_state if return_dict else outputs[0]
 
 
-        lm_logits = self.embed_out(hidden_states) 
-        
-            
+        lm_logits = self.embed_out(hidden_states)
+
+
 
         if not return_dict:
             output = (lm_logits,) + outputs[1:]
@@ -2681,8 +2720,8 @@ class FlaxGPTNeoXRetriever(nn.Module):
         self.threshold_nei_scores = self.config.threshold_nei_scores
         self.num_sequence_chunks = self.config.max_position_embeddings//self.config.chunk_size
         self.learned_margin = self.param('learned_margin', jax.nn.initializers.constant(0), (1,))
-    
-        
+
+
         if self.config.ss_schedule_steps is not None and \
                         self.config.scheduled_sampling_max_prob is not None \
                         and self.config.scheduled_sampling_min_prob is not None \
@@ -2693,7 +2732,7 @@ class FlaxGPTNeoXRetriever(nn.Module):
                                                                             max_value=self.config.scheduled_sampling_max_prob)
         else:
             self.scheduled_sampling_schedule_fn = None
-            
+
     @partial(
         nn.vmap,
         in_axes=(0, None, None),
@@ -2702,10 +2741,10 @@ class FlaxGPTNeoXRetriever(nn.Module):
         split_rngs={'dropout': True, "params": False},
     )
     def compute_query_scores(self, encoded_output, n_skip_chunks, num_neighbors):
-        query_based_scores = jnp.einsum('qd,kd->qk', encoded_output.query_chunks, 
+        query_based_scores = jnp.einsum('qd,kd->qk', encoded_output.query_chunks,
                                                         encoded_output.key_chunks,
                                                         precision=self.precision)
-        
+
         if n_skip_chunks>0:
             chunk_mask = encoded_output.chunk_mask
             segment_mask = create_segment_mask(query_based_scores.shape[0], n_skip_chunks)
@@ -2714,7 +2753,7 @@ class FlaxGPTNeoXRetriever(nn.Module):
             chunk_mask = jnp.ones_like(query_based_scores).astype(bool)
         query_score_based_idx = topk_chunks(query_based_scores, num_candidates=num_neighbors, where=chunk_mask)
         return query_based_scores, query_score_based_idx, chunk_mask
-    
+
     @partial(
         nn.vmap,
         in_axes=(0, 0),
@@ -2727,13 +2766,13 @@ class FlaxGPTNeoXRetriever(nn.Module):
                                        chunk_mask,
                                         margin=jax.nn.softplus(self.learned_margin),
                                         offset=self.config.atsc_margin_min)
-        
+
         return scaled_scores
-    
+
     @partial(
         nn.vmap,
         in_axes=(0, 0, 0),
-        out_axes=0,   
+        out_axes=0,
         variable_axes={'params': None, 'intermediates': 0, "cache" : 0},
         split_rngs={'dropout': True, "params": False},
     )
@@ -2741,9 +2780,9 @@ class FlaxGPTNeoXRetriever(nn.Module):
         idx_scores = jnp.take_along_axis(scaled_scores, idxs, axis=-1)
         idx_mask = jnp.take_along_axis(chunk_mask, idxs, axis=-1)
         return idx_scores, idx_mask
-    
-    
-        
+
+
+
     def __call__(
         self,
         encoded_output,
@@ -2760,11 +2799,11 @@ class FlaxGPTNeoXRetriever(nn.Module):
             n_skip_chunks = self.n_skip_chunks
         if num_neighbors is None:
             num_neighbors = self.num_neighbors
-            
+
         query_based_scores, query_score_based_idx, chunk_mask = self.compute_query_scores(encoded_output, n_skip_chunks, num_neighbors)
         scaled_scores = self.apply_scaling(query_based_scores, chunk_mask)
         query_att_scores, query_neighbor_mask = self.batch_take_along_axis(scaled_scores, chunk_mask, query_score_based_idx)
-        
+
         self.sow('intermediates', f'query_att_scores', query_att_scores)
         if retriever_supervision is not None:
             ret_loss_obj = self.compute_retriever_loss(query_based_scores,
@@ -2776,14 +2815,14 @@ class FlaxGPTNeoXRetriever(nn.Module):
             target_att_scores, target_neighbor_mask = self.batch_take_along_axis(scaled_scores, chunk_mask, ret_loss_obj.target_score_based_idx)
             if self.config.use_allowed_tar_mask:
                 target_neighbor_mask = ret_loss_obj.target_neighbor_mask #?????
-            
+
             self.sow('intermediates', f'target_att_scores', target_att_scores)
-            
+
             top_nei_idx, nei_mask, att_scores = self.apply_scheduled_sampling(
                                 query_score_based_idx=query_score_based_idx,
                                 chunk_mask=query_neighbor_mask,
                                 target_score_based_idx=target_score_based_idx,
-                                target_neighbor_mask=target_neighbor_mask, 
+                                target_neighbor_mask=target_neighbor_mask,
                                 train_step=train_step,
                                 query_att_scores=query_att_scores,
                                 target_att_scores=target_att_scores,
@@ -2792,19 +2831,19 @@ class FlaxGPTNeoXRetriever(nn.Module):
             top_nei_idx, nei_mask, att_scores = query_score_based_idx, query_neighbor_mask, query_att_scores
             aux_loss = None
             ret_metrics = {}
-        
-            
+
+
         att_scores = jnp.where(att_scores>0, att_scores, 0)
         if self.config.stop_grad_trick:
             att_scores = att_scores - jax.lax.stop_gradient(att_scores)
-            
-            
+
+
             # if self.config.log_debug_metrics and not self.is_initializing():
             #     self.sow('intermediates', f'nei_mask', nei_mask)
             #     self.sow('intermediates', f'pre_nei_mask', pre_nei_mask)
             #     self.sow('intermediates', f'neighbor_attention_mask', neighbor_attention_mask)
         neighbor_hidden_states, neighbor_mask, nei_position_ids, att_scores = self.select_nei(encoded_output, top_nei_idx, nei_mask, att_scores, num_neighbors, append_next_chunk)
-        
+
         if aux_loss is not None:
             if self.config.aux_scale>0:
                 loss_scale = self.config.aux_scale
@@ -2817,16 +2856,16 @@ class FlaxGPTNeoXRetriever(nn.Module):
                                               neighbor_hidden_states=neighbor_hidden_states,
                                               loss_scale=loss_scale,
                                               neighbor_mask=neighbor_mask,
-                                              retrieval_metrics=ret_metrics, 
+                                              retrieval_metrics=ret_metrics,
                                               att_scores=att_scores,
                                               encoded_output=encoded_output,
                                               nei_position_ids=nei_position_ids,
                                               )
-        
+
     @partial(
         nn.vmap,
         in_axes=(0, 0, 0, 0, None, None),
-        out_axes=0,   
+        out_axes=0,
         variable_axes={'params': None, 'intermediates': 0, "cache" : 0},
         split_rngs={'dropout': True, "params": False},
     )
@@ -2844,7 +2883,7 @@ class FlaxGPTNeoXRetriever(nn.Module):
             neighbor_mask = jnp.broadcast_to(jnp.expand_dims(nei_mask, axis=-1), neighbor_hidden_states.shape[:-1])
             nei_position_ids = jnp.arange(2*chunk_size)
             nei_position_ids = jnp.broadcast_to(nei_position_ids[None, :], (num_document_chunks*num_neighbors, 2*chunk_size))
-            
+
         else:
             neighbor_hidden_states,neighbor_mask,nei_position_ids =  new_lookup_neighbors(top_nei_idx,
                                                                                           cand_hidden_states,
@@ -2852,15 +2891,15 @@ class FlaxGPTNeoXRetriever(nn.Module):
                                                                                           append_next_chunk,
                                                                                           module=jnp,
                                                                                           nei_mask=nei_mask)
-            
-            
-                
-            
-            
+
+
+
+
+
             if self.config.ret_score_in_cca:
                 att_scores = jnp.broadcast_to(jnp.expand_dims(att_scores, axis=-1), neighbor_hidden_states.shape[:-1])
         return neighbor_hidden_states, neighbor_mask, nei_position_ids, att_scores
-    
+
     @partial(
         nn.vmap,
         in_axes=(0, 0, None, None, None),

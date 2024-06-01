@@ -1,6 +1,9 @@
 import os
 import time
 import sys
+
+from EasyLM.models.neox.neox_model_torch import GPTNeoXForCausalLM
+
 if "DEBUG" in os.environ:
     #   os.system('kill -9 $(lsof -t -i tcp:5678)')
     time.sleep(2)
@@ -85,6 +88,16 @@ def load_model(config):
     tokenizer = hf_model.config.get_tokenizer(truncation_side='right', padding_side='right')
     params = hf_model.params
     rng_keys = hf_model.config.rng_keys()
+
+
+    from transformers.modeling_flax_pytorch_utils import load_flax_weights_in_pytorch_model
+
+    neo_config = GPTNeoXConfig.load_config('json::/Users/shahar.satamkar/Desktop/Masters/RPT/model/config.json')
+    hf_model = GPTNeoXForCausalLM(config=neo_config)
+    load_flax_weights_in_pytorch_model(hf_model, params)
+
+    hf_model.save_pretrained('neox_model_torch', safe_serialization=True)
+
 
     print('.')
 
@@ -508,7 +521,7 @@ def load_model(config):
     
 
     def _encode(text):
-        lowcoder_bs = config.lowcoder_batch_size
+        lowcoder_bs = 1 #config.lowcoder_batch_size # TODO: Revert later
         n_examples = len(text)
         inputs = [prefix[:50000] for prefix in text]
         inputs = [prepare_inputs(prefix, config.split_by_newline) for prefix in text]

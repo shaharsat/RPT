@@ -40,7 +40,7 @@ class GPTNeoXRetrieverNeighborOutput(ModelOutput):
     nei_position_ids: Optional[torch.Tensor] = None
 
 @dataclass
-class FlaxGPTNeoXRetrieverEncodedOutput(ModelOutput):
+class GPTNeoXRetrieverEncodedOutput(ModelOutput):
     original_hidden_states: torch.Tensor = None
     encoded_hidden_states: torch.Tensor = None
     attention_mask: torch.Tensor = None
@@ -61,7 +61,20 @@ class GPTNeoXLMOutput(ModelOutput):
     lowcoder_attentions: Optional[Tuple[torch.Tensor]] = None
     retriever_output: GPTNeoXRetrieverNeighborOutput = None
     retriever_input: Optional[torch.Tensor] = None
-    
+
+@dataclass
+class GPTNeoXModelOutput(ModelOutput):
+    last_hidden_state: torch.Tensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None
+    upcoder_hidden_states: Optional[Tuple[torch.Tensor]] = None
+    upcoder_attentions: Optional[Tuple[torch.Tensor]] = None
+    cross_attentions: Optional[Tuple[torch.Tensor]] = None
+    lowcoder_last_hidden_state: Optional[torch.Tensor] = None
+    lowcoder_hidden_states: Optional[Tuple[torch.Tensor]] = None
+    lowcoder_attentions: Optional[Tuple[torch.Tensor]] = None
+    retriever_output: GPTNeoXRetrieverNeighborOutput = None
+    retriever_input: Optional[torch.Tensor] = None
+
 def new_lookup_neighbors(top_nei_idx, cand_hidden_states, cand_attention_mask, append_next_chunk, module,
                          nei_mask=None):
     cand_attention_mask = cand_attention_mask.reshape(cand_hidden_states.shape[:-1])
@@ -213,6 +226,6 @@ def add_batch_index(x,j):
     return x
 
 def collate_fn(batch):
-    input_ids = np.array([x["input_ids"].squeeze() for x in batch])
-    attention_mask = np.array([x["attention_mask"].squeeze() for x in batch])
+    input_ids = torch.Tensor([x["input_ids"].squeeze() for x in batch])
+    attention_mask = torch.Tensor([x["attention_mask"].squeeze() for x in batch])
     return input_ids, attention_mask
