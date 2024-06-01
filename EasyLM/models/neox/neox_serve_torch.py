@@ -462,7 +462,7 @@ def load_model(config):
             new_x = {}
             for key in x.keys():
                 if key in keep_fields:
-                    new_x[key] = x[key]
+                    new_x[key] = x[key].detach().numpy()
             return new_x
         output_dict = {}
         for batch in chunked(inputs, lowcoder_bs):

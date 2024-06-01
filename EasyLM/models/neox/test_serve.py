@@ -47,7 +47,7 @@ print("hi")
 print(config)
 
 #encode_output = _encode([''.join(['hello' for _ in range(64)] + ['world' for _ in range(64)])])
-encode_output = _encode(['hello'*100])
+encode_output = _encode(['hello'*100, 'world', 'this', 'is', 'a', 'test'])
 print(encode_output)
 
 #out = _greedy_until(max_length=100,**decoded_body)

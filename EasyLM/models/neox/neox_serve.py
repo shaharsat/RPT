@@ -89,15 +89,22 @@ def load_model(config):
     params = hf_model.params
     rng_keys = hf_model.config.rng_keys()
 
-
+    """
     from transformers.modeling_flax_pytorch_utils import load_flax_weights_in_pytorch_model
 
     neo_config = GPTNeoXConfig.load_config('json::/Users/shahar.satamkar/Desktop/Masters/RPT/model/config.json')
     hf_model = GPTNeoXForCausalLM(config=neo_config)
+
+    params['gpt_neox']['layers']['blocks'] = {}
+    for i in range(len(params['gpt_neox']['layers'])-1):
+        layer = params['gpt_neox']['layers'][str(i)]
+        del params['gpt_neox']['layers'][str(i)]
+        params['gpt_neox']['layers']['blocks'].update({str(i): layer})
+
     load_flax_weights_in_pytorch_model(hf_model, params)
 
     hf_model.save_pretrained('neox_model_torch', safe_serialization=True)
-
+    """
 
     print('.')
 
@@ -521,7 +528,7 @@ def load_model(config):
     
 
     def _encode(text):
-        lowcoder_bs = 1 #config.lowcoder_batch_size # TODO: Revert later
+        lowcoder_bs = config.lowcoder_batch_size
         n_examples = len(text)
         inputs = [prefix[:50000] for prefix in text]
         inputs = [prepare_inputs(prefix, config.split_by_newline) for prefix in text]
@@ -557,6 +564,7 @@ def load_model(config):
             [enc for _, enc in sorted(output_dict[i], key=lambda x: x[0])]
             for i in range(n_examples)
         ]
+
         encoded_output = [pickle.dumps(enc) for enc in encoded_output]
         encoded_output = [base64.b64encode(enc).decode() for enc in encoded_output]
         return encoded_output
