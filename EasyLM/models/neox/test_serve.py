@@ -29,7 +29,7 @@ def get_config():
     return config
 config = get_config()
 
-config['input_length'] = 128
+config['input_length'] = 256
 
 _loglikelihood, _loglikelihood_rolling, _generate, _greedy_until, \
     _encode, _old_greedy_until = load_model(config)

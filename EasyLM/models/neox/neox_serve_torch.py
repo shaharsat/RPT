@@ -332,7 +332,6 @@ def load_model(config):
             input_tokens=input_tokens,
             attention_mask=input_mask,
         )
-        print(batch)
         output, sharded_rng = forward_generate(
             hf_model, batch, temperature
         )
@@ -390,13 +389,11 @@ def load_model(config):
 
                 batch = dict(input_tokens=input_tokens, attention_mask=attention_mask)
 
-                # print(batch)
                 output, sharded_rng = forward_greedy_generate(
                    hf_model, sharded_rng, batch
                 )
-                # print(output)
                 # TODO: to torch device
-                # print(output)
+
 
                 total_length += output.shape[1]
                 output_text = tokenizer.batch_decode(output)[0]
@@ -450,48 +447,18 @@ def load_model(config):
 
     def _encode(text):
         lowcoder_bs = config.lowcoder_batch_size
-        n_examples = len(text)
-        inputs = [prefix[:50000] for prefix in text]
         inputs = [prepare_inputs(prefix, config.split_by_newline) for prefix in text]
         inputs = [add_batch_index(x,j) for j,x in enumerate(inputs)]
         inputs = sum(inputs,[])
-        keep_fields = config.keep_fields.split(",")
-        if len(keep_fields)==1 and keep_fields[0]=="":
-            keep_fields = []
-        def format_enc(x):
-            new_x = {}
-            for key in x.keys():
-                if key in keep_fields:
-                    new_x[key] = x[key].detach().numpy()
-            return new_x
-        output_dict = {}
+
+        outputs = []
         for batch in chunked(inputs, lowcoder_bs):
             input_ids, attention_mask = collate_fn(batch)
-            encoded_output = []
-            for input_id, attention_mask_id in zip(input_ids, attention_mask):
-                single_encoded_output = lowcoder_forward(hf_model, input_id.unsqueeze(0), attention_mask_id.unsqueeze(0)) # TODO: Handle multi device: min_device_batch=max(lowcoder_bs//jax.local_device_count(),1))
-                encoded_output.append(single_encoded_output)
+            encoded_output = lowcoder_forward(hf_model, input_ids, attention_mask)
+            for key in encoded_output['key_chunks']:
+                outputs.append(key)
 
-            # TODO: Torch to device
-            #encoded_output = tree_unstack(encoded_output)
-            # TODO: Handle tree unpacking from torch
-            for batch_el, enc in zip(batch, encoded_output):
-                enc = dict(enc)
-                enc["input_ids"] = batch_el["input_ids"]
-                batch_index = batch_el["batch_index"]
-                window_index = batch_el["window_index"]
-                if batch_index not in output_dict:
-                    output_dict[batch_index] = []
-                if len(keep_fields)>0:
-                    enc = format_enc(enc)
-                output_dict[batch_index].append((window_index, enc))
-        encoded_output = [
-            [enc for _, enc in sorted(output_dict[i], key=lambda x: x[0])]
-            for i in range(n_examples)
-        ]
-        encoded_output = [pickle.dumps(enc) for enc in encoded_output]
-        encoded_output = [base64.b64encode(enc).decode() for enc in encoded_output]
-        return encoded_output
+        return torch.stack(outputs)
 
     return _loglikelihood, _loglikelihood_rolling, _generate, _greedy_until, _encode, _old_greedy_until
 

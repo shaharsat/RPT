@@ -18,8 +18,10 @@ from distutils import dist
 from typing import Optional, Tuple, Union, Dict, Any, List
 
 import einops
+import numpy as np
 import torch
 import torch.utils.checkpoint
+from more_itertools import chunked
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
@@ -42,10 +44,8 @@ from transformers.utils import logging
 from EasyLM.models.neox.attention_torch import my_dot_product_attention_weights
 from EasyLM.models.neox.gate_torch import GriffinGate
 from EasyLM.models.neox.rpt_torch_utils import EncodedNeighbors, new_lookup_neighbors, GPTNeoXRetrieverNeighborOutput, \
-    GPTNeoXRetrieverEncodedOutput, GPTNeoXLMOutput, GPTNeoXModelOutput
+    GPTNeoXRetrieverEncodedOutput, GPTNeoXLMOutput, GPTNeoXModelOutput, add_batch_index, create_prepare_inputs
 from EasyLM.torch_utils import make_causal_mask, assign_slice, combine_masks
-
-import jax
 
 class GPTNeoXConfig(PretrainedConfig):
     r"""
@@ -415,21 +415,13 @@ class GPTNeoXAttention(nn.Module):
         #   --> [batch, seq_len, (np * 3 * head_size)]
         # qkv = self.query_key_value(hidden_states)
 
-        jax.debug.print('1: hidden_states={x}', x=hidden_states)
         fused_qkv = self.query_key_value(hidden_states)
-        jax.debug.print('2: fused_qkv={x}', x=fused_qkv)
         batch, seq_len, _ = fused_qkv.shape
         fused_qkv = self._split_heads(fused_qkv)
-        jax.debug.print('3: fused_qkv={x}', x=fused_qkv)
-        query, key, value = torch.split(fused_qkv, seq_len, dim=-1) # TODO: Verify seq_len
-        jax.debug.print('4: query={x}', x=query)
-        jax.debug.print('4: key={x}', x=key)
-        jax.debug.print('4: value={x}', x=value)
+        query, key, value = torch.split(fused_qkv, fused_qkv.shape[-1]//3, dim=-1) # TODO: Verify seq_len
 
         cos, sin = self.rotary_emb(seq_len)
 
-        jax.debug.print('5: cos={x}', x=cos)
-        jax.debug.print('5: sin={x}', x=sin)
         if self.rotary_ndims is not None:
             k_rot = key[..., : self.rotary_ndims]
             k_pass = key[..., self.rotary_ndims:]
@@ -437,22 +429,10 @@ class GPTNeoXAttention(nn.Module):
             q_rot = query[..., : self.rotary_ndims]
             q_pass = query[..., self.rotary_ndims:]
 
-            jax.debug.print('6: k_rot={x}', x=k_rot)
-            jax.debug.print('6: k_pass={x}', x=k_pass)
-
-            jax.debug.print('6: q_rot={x}', x=q_rot)
-            jax.debug.print('6: q_pass={x}', x=q_pass)
-
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin, position_ids)
-
-            jax.debug.print('7: q_rot={x}', x=q_rot)
-            jax.debug.print('7: q_pass={x}', x=q_pass)
 
             key = torch.concatenate([k_rot, k_pass], dim=-1)
             query = torch.concatenate([q_rot, q_pass], dim=-1)
-
-            jax.debug.print('8: key={x}', x=key)
-            jax.debug.print('8: query={x}', x=query)
         else:
             query, key = apply_rotary_pos_emb(query, key, cos, sin, position_ids)
         query = query.type(self.dtype)
@@ -490,10 +470,6 @@ class GPTNeoXAttention(nn.Module):
         attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
         attention_bias[attention_mask > 0] = 0.0
 
-        jax.debug.print('9: query={x}', x=query)
-        jax.debug.print('9: key={x}', x=key)
-        jax.debug.print('9: attention_bias={x}', x=attention_bias)
-
         # TODO: Add deterministic
         # Compute attention
         attn_weights = my_dot_product_attention_weights(
@@ -504,8 +480,6 @@ class GPTNeoXAttention(nn.Module):
             dtype=torch.float32,
             apply_tanh=self.config.tanh_causal_att,
         )
-
-        jax.debug.print('10: attn_weights={x}', x=attn_weights)
 
         attn_weights = attn_weights.type(self.dtype)
         attn_output = torch.einsum("bhqk,bkhd->bqhd", attn_weights, value.type(self.dtype))
@@ -669,15 +643,9 @@ class GPTNeoXCrossAttention(nn.Module):
     ) -> Tuple[torch.Tensor]:
         is_cross_attention = key_value_states is not None
 
-        jax.debug.print('A1: hidden_states={x}', x=hidden_states)
-
         xq = self.wq(hidden_states)
-        jax.debug.print('A2.1: xq={x}', x=xq)
         xq = self._split_heads(xq).type(self.dtype)
-        jax.debug.print('A2.2: xq={x}', x=xq)
         xq = self.q_layernorm(xq) if self.qk_layernorm else xq
-
-        jax.debug.print('A2: xq={x}', x=xq)
 
         if not is_cross_attention:
             key_value_states = hidden_states
@@ -686,16 +654,10 @@ class GPTNeoXCrossAttention(nn.Module):
         xk = self._split_heads(xk).type(self.dtype)
         xk = self.k_layernorm(xk) if self.qk_layernorm else xk
 
-        jax.debug.print('A3: xk={x}', x=xk)
-
         xv = self.wv(key_value_states)
         xv = self._split_heads(xv).type(self.dtype)
 
-        jax.debug.print('A4: xv={x}', x=xv)
-
         null_k = self.k_layernorm(self.null_k) if self.qk_layernorm else self.null_k
-
-        jax.debug.print('A5: null_k={x}', x=null_k)
 
         query_length, key_length = xq.shape[1], xk.shape[1]
         batch_size = hidden_states.shape[0]
@@ -706,11 +668,7 @@ class GPTNeoXCrossAttention(nn.Module):
             position_ids = torch.arange(query_length, dtype=torch.int32)
             position_ids = torch.broadcast_to(position_ids[None, :], (batch_size, query_length))
 
-        jax.debug.print('A6: position_ids={x}', x=position_ids)
-
         freqs_cis = self.freqs_cis[position_ids]
-
-        jax.debug.print('A7: freqs_cis={x}', x=freqs_cis)
 
         if not is_cross_attention:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype, rot_dim=self.head_dim)
@@ -721,16 +679,10 @@ class GPTNeoXCrossAttention(nn.Module):
             freqs_cis_k = self.freqs_cis[kv_position_ids]
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, freqs_cis_k=freqs_cis_k, dtype=self.dtype, rot_dim=self.head_dim)
 
-        jax.debug.print('A8: xq={x}', x=xq)
-        jax.debug.print('A8: xk={x}', x=xk)
-
         null_k = torch.broadcast_to(null_k, (batch_size, 1, self.num_heads, self.head_dim)).type(self.dtype)
         xk = torch.concatenate((xk, null_k), dim=-3)
         null_v = torch.broadcast_to(self.null_v, (batch_size, 1, self.num_heads, self.head_dim)).type(self.dtype)
         xv = torch.concatenate((xv, null_v), dim=-3)
-
-        jax.debug.print('A9: xk={x}', x=xk)
-        jax.debug.print('A9: xv={x}', x=xv)
 
         if attention_mask is not None:
             null_mask = torch.ones((attention_mask.shape[0], 1), dtype=torch.float32)
@@ -751,8 +703,6 @@ class GPTNeoXCrossAttention(nn.Module):
         else:
             attention_bias = None
 
-        jax.debug.print('A10: attention_bias={x}', x=attention_bias)
-
         attn_weights = my_dot_product_attention_weights(
             xq,
             xk,
@@ -763,17 +713,11 @@ class GPTNeoXCrossAttention(nn.Module):
             apply_tanh=self.config.tanh_xatt,
         )
 
-        jax.debug.print('A11: attn_weights={x}', x=attn_weights)
-
         attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv.type(self.dtype))
-
-        jax.debug.print('A12: attn_output={x}', x=attn_output)
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output).type(self.dtype)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
-
-        jax.debug.print('A13: outputs={x}', x=outputs)
 
         return outputs
 
@@ -1200,9 +1144,7 @@ class GPTNeoXBlock(nn.Module):
         else:
             cca_hidden_states = None
 
-        jax.debug.print('sum={x}', x=torch.sum(hidden_states))
         att_input = self.input_layernorm(hidden_states).type(self.dtype)
-        jax.debug.print('att_input={x}',x=att_input)
         #print(f"{att_input=}", flush=True)
         # att_input = with_sharding_constraint(att_input, PS(("dp", "fsdp"), None, "mp"))
         # attention_mask = with_sharding_constraint(attention_mask, PS(("dp", "fsdp"), None))
@@ -1532,14 +1474,8 @@ class GPTNeoXRetriever(nn.Module):
         original_attention_mask_shape = attention_mask.shape
         # #print(hidden_states.shape)
 
-        jax.debug.print('11: hidden_states={x}', x=hidden_states)
-        jax.debug.print('11: attention_mask={x}', x=attention_mask)
-
         original_hidden_states = einops.rearrange(hidden_states, 'b (l c) ... -> (b l) c ... ', c=pooling_size)
         attention_mask = einops.rearrange(attention_mask, 'b (l c) ... -> (b l) c ... ', c=pooling_size)
-
-        jax.debug.print('12: hidden_states={x}', x=hidden_states)
-        jax.debug.print('12: attention_mask={x}', x=attention_mask)
 
         # add a chunk dimension
         # 1. apply bi-dir attention
@@ -1549,16 +1485,10 @@ class GPTNeoXRetriever(nn.Module):
             deterministic=deterministic,
             output_attentions=output_attentions)
 
-        jax.debug.print('13: preret_bi_output={x}', x=preret_bi_output[0])
-
         encoded_hidden_states = preret_bi_output[0] + original_hidden_states
-
-        jax.debug.print('14: encoded_hidden_states={x}', x=encoded_hidden_states)
 
         # 2. pool
         pooled_hidden_states = encoded_hidden_states.mean(dim=-2)
-
-        jax.debug.print('15: pooled_hidden_states={x}', x=pooled_hidden_states)
 
         # 3. project to query chunks and key chunks
         key_chunks = self.key_projection(self.pre_key_norm(pooled_hidden_states))
@@ -1567,22 +1497,12 @@ class GPTNeoXRetriever(nn.Module):
         if chunk_mask.shape[0] != pooled_hidden_states.shape[0]:
             chunk_mask = chunk_mask[:pooled_hidden_states.shape[0], ...]
 
-        jax.debug.print('16: key_chunks={x}', x=key_chunks)
-        jax.debug.print('16: query_chunks={x}', x=query_chunks)
-        jax.debug.print('16: chunk_mask={x}', x=chunk_mask)
-
         # nei_pos = jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0, a_max=2*self.config.chunk_size-1)
         original_hidden_states = original_hidden_states.reshape(original_hidden_states_shape)
         attention_mask = attention_mask.reshape(original_attention_mask_shape)
 
-        jax.debug.print('17: original_hidden_states={x}', x=original_hidden_states)
-        jax.debug.print('17: attention_mask={x}', x=attention_mask)
-
         key_chunks = key_chunks / torch.linalg.norm(key_chunks, dim=-1).unsqueeze(-1)
         query_chunks = query_chunks / torch.linalg.norm(query_chunks, dim=-1).unsqueeze(-1)
-
-        jax.debug.print('18: key_chunks={x}', x=key_chunks)
-        jax.debug.print('18: query_chunks={x}', x=query_chunks)
 
         return GPTNeoXRetrieverEncodedOutput(
             original_hidden_states=original_hidden_states,
@@ -1670,7 +1590,6 @@ class GPTNeoXBlockCollection(nn.Module):
                 cca_kwargs=cca_kwargs,
             )
             hidden_states = layer_outputs[0]
-            jax.debug.print('hidden_states={x}', x=hidden_states)
 
             if output_attentions:
                 all_attentions += (layer_outputs[1],)
@@ -2223,11 +2142,8 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
                  ):
         input_embeds = self.embed_in(input_ids.type(torch.int))
 
-        jax.debug.print('input_embeds={x}', x=input_embeds)
-
         hidden_states = self.emb_dropout(input_embeds)
 
-        jax.debug.print('emb_dropout={x}', x=hidden_states)
 
         lowcoder_outputs = self.layers(
             hidden_states,
@@ -2404,6 +2320,9 @@ class GPTNeoXForCausalLMModule(GPTNeoXPreTrainedModel):
         self.gpt_neox = GPTNeoXModel(config)
         self.embed_out = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        prefix_tokenizer = config.get_tokenizer(truncation_side='left', padding_side='left')
+        self.prepare_inputs = create_prepare_inputs(prefix_tokenizer, input_length=2048) # TODO: 2048 ?
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -2463,8 +2382,6 @@ class GPTNeoXForCausalLMModule(GPTNeoXPreTrainedModel):
         >>> prediction_logits = outputs.logits
         ```"""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        jax.debug.print('input_ids={x}', x=input_ids)
 
         outputs = self.gpt_neox(
             input_ids,
@@ -2575,8 +2492,6 @@ class GPTNeoXForCausalLMModule(GPTNeoXPreTrainedModel):
             output_attentions=output_attentions,
         )
 
-        jax.debug.print("#################")
-
         outputs = self.gpt_neox.retriever.preret_encode(
             lowcoder_outputs.last_hidden_state,
             attention_mask,
@@ -2677,6 +2592,27 @@ class GPTNeoXForCausalLMModule(GPTNeoXPreTrainedModel):
         if should_squeeze:
             output = output.squeeze(0)
         return output
+
+    def encode(self, text, batch_size=64, split_by_newline=False):
+        inputs = [self.prepare_inputs(prefix, split_by_newline) for prefix in text]
+        inputs = [add_batch_index(x,j) for j,x in enumerate(inputs)]
+        inputs = sum(inputs,[])
+
+        def collate_fn(batch):
+            with torch.no_grad():
+                input_ids = torch.Tensor(np.array([x["input_ids"].squeeze() for x in batch]))
+                attention_mask = torch.Tensor(np.array([x["attention_mask"].squeeze() for x in batch]))
+                return input_ids, attention_mask
+
+        with torch.no_grad():
+            outputs = []
+            for batch in chunked(inputs, batch_size):
+                input_ids, attention_mask = collate_fn(batch)
+                encoded_output = self.batch_lowcoder_forward(input_ids, attention_mask)
+                for key in encoded_output['key_chunks']:
+                    outputs.append(key)
+
+        return torch.stack(outputs)
 
 
 class GPTNeoXForCausalLM(GPTNeoXForCausalLMModule):
