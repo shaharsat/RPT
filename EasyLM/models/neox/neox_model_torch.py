@@ -431,8 +431,8 @@ class GPTNeoXAttention(nn.Module):
 
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin, position_ids)
 
-            key = torch.concatenate([k_rot, k_pass], dim=-1)
-            query = torch.concatenate([q_rot, q_pass], dim=-1)
+            key = torch.cat([k_rot, k_pass], dim=-1)
+            query = torch.cat([q_rot, q_pass], dim=-1)
         else:
             query, key = apply_rotary_pos_emb(query, key, cos, sin, position_ids)
         query = query.type(self.dtype)
@@ -567,8 +567,8 @@ def apply_rotary_emb(
         xq_rot, xk_rot = apply_rotary_emb_(xq_rot, xk_rot, freqs_cis, dtype=dtype, freqs_cis_k=freqs_cis_k)
 
         # Concatenate the rotated and non-rotated parts
-        xq_out = torch.concatenate((xq_rot, xq_pass), dim=-1)
-        xk_out = torch.concatenate((xk_rot, xk_pass), dim=-1)
+        xq_out = torch.cat((xq_rot, xq_pass), dim=-1)
+        xk_out = torch.cat((xk_rot, xk_pass), dim=-1)
     else:
         xq_out, xk_out = apply_rotary_emb_(xq, xk, freqs_cis, dtype=dtype, freqs_cis_k=freqs_cis_k)
 
@@ -680,20 +680,20 @@ class GPTNeoXCrossAttention(nn.Module):
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, freqs_cis_k=freqs_cis_k, dtype=self.dtype, rot_dim=self.head_dim)
 
         null_k = torch.broadcast_to(null_k, (batch_size, 1, self.num_heads, self.head_dim)).type(self.dtype)
-        xk = torch.concatenate((xk, null_k), dim=-3)
+        xk = torch.cat((xk, null_k), dim=-3)
         null_v = torch.broadcast_to(self.null_v, (batch_size, 1, self.num_heads, self.head_dim)).type(self.dtype)
-        xv = torch.concatenate((xv, null_v), dim=-3)
+        xv = torch.cat((xv, null_v), dim=-3)
 
         if attention_mask is not None:
             null_mask = torch.ones((attention_mask.shape[0], 1), dtype=torch.float32)
-            attention_mask = torch.concatenate((attention_mask, null_mask), dim=-1)
+            attention_mask = torch.cat((attention_mask, null_mask), dim=-1)
             attention_mask = attention_mask.unsqueeze(-2).unsqueeze(-2)
 
             if retriever_scores is None:
                 attention_bias = torch.full(attention_mask.shape, 0.0).type(self.dtype)
             else:
                 null_ret_score = torch.zeros((retriever_scores.shape[0], 1), dtype=torch.float32)
-                attention_bias = torch.concatenate((retriever_scores, null_ret_score), dim=-1)
+                attention_bias = torch.cat((retriever_scores, null_ret_score), dim=-1)
                 attention_bias = attention_bias.unsqueeze(-2).unsqueeze(-2)
 
             attention_bias[attention_mask <= 0] = torch.finfo(self.dtype).min
@@ -851,7 +851,7 @@ class GPTNeoXRotaryEmbedding(nn.Module):
             t,
             self.inv_freq,
         )
-        emb = torch.concatenate((freqs, freqs), dim=-1)
+        emb = torch.cat((freqs, freqs), dim=-1)
         cos = torch.cos(emb).unsqueeze(0).unsqueeze(0) # TODO: Verify
         sin = torch.sin(emb).unsqueeze(0).unsqueeze(0)
         return cos, sin
@@ -1444,7 +1444,7 @@ class GPTNeoXRetriever(nn.Module):
             shifted_hidden_states = torch.pad(cand_hidden_states[1:, ...], ((0, 1), (0, 0), (0, 0)))
             curr_neighbor_hidden_states = cand_hidden_states[top_nei_idx.reshape(-1)]
             next_neighbor_hidden_states = shifted_hidden_states[top_nei_idx.reshape(-1)]
-            neighbor_hidden_states = torch.concatenate((curr_neighbor_hidden_states, next_neighbor_hidden_states),
+            neighbor_hidden_states = torch.cat((curr_neighbor_hidden_states, next_neighbor_hidden_states),
                                                        dim=-2)
             neighbor_hidden_states = einops.rearrange(neighbor_hidden_states, '(b k) r d -> b k r d',
                                                       b=num_document_chunks)
