@@ -1,7 +1,12 @@
 import torch
+import sys
+sys.path.append('/Users/shahar.satamkar/Desktop/Masters/RPT')
+sys.path.append('/a/home/cc/students/cs/ohadr/mteb/RPT')
+print(sys.path)
 from mteb import AmazonReviewsClassification, Banking77Classification
 from EasyLM.models.neox.neox_model_torch import GPTNeoXForCausalLM
 import mteb
+
 
 
 """
