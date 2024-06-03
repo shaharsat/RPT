@@ -2598,7 +2598,6 @@ class GPTNeoXForCausalLMModule(GPTNeoXPreTrainedModel):
         inputs = [self.prepare_inputs(prefix, split_by_newline) for prefix in text]
         inputs = [add_batch_index(x,j) for j,x in enumerate(inputs)]
         inputs = sum(inputs,[])
-
         def collate_fn(batch):
             with torch.no_grad():
                 input_ids = torch.tensor(np.array([x["input_ids"].squeeze() for x in batch]), device=self.device)
@@ -2614,7 +2613,7 @@ class GPTNeoXForCausalLMModule(GPTNeoXPreTrainedModel):
                 for key in encoded_output['key_chunks']:
                     outputs.append(key)
 
-        return torch.stack(outputs)
+        return torch.stack(outputs).detach().numpy()
 
 
 class GPTNeoXForCausalLM(GPTNeoXForCausalLMModule):
