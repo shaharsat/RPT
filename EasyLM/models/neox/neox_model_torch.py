@@ -516,7 +516,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: torc
     freqs = torch.outer(t, freqs).type(dtype)
     sin, cos = torch.sin(freqs), torch.cos(freqs)
     freqs_cis = cos + 1j * sin
-    return torch.asarray(freqs_cis).to(device)
+    return torch.tensor(freqs_cis, device=device)
 
 
 def apply_rotary_emb_(
@@ -668,7 +668,7 @@ class GPTNeoXCrossAttention(nn.Module):
 
         if position_ids is None:
             position_ids = torch.arange(query_length, dtype=torch.int32)
-            position_ids = torch.broadcast_to(position_ids[None, :], (batch_size, query_length))
+            position_ids = torch.broadcast_to(position_ids[None, :], (batch_size, query_length)).type(torch.long)
 
         freqs_cis = self.freqs_cis[position_ids]
 
