@@ -421,6 +421,7 @@ class GPTNeoXAttention(nn.Module):
         query, key, value = torch.split(fused_qkv, fused_qkv.shape[-1]//3, dim=-1) # TODO: Verify seq_len
 
         cos, sin = self.rotary_emb(seq_len)
+        cos, sin = cos.to(hidden_states.device), sin.to(hidden_states.device)
 
         if self.rotary_ndims is not None:
             k_rot = key[..., : self.rotary_ndims]
