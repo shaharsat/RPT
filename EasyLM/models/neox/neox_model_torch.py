@@ -691,9 +691,9 @@ class GPTNeoXCrossAttention(nn.Module):
             attention_mask = attention_mask.unsqueeze(-2).unsqueeze(-2)
 
             if retriever_scores is None:
-                attention_bias = torch.full(attention_mask.shape, 0.0).type(self.dtype)
+                attention_bias = torch.full(attention_mask.shape, 0.0).type(self.dtype).to(hidden_states.device)
             else:
-                null_ret_score = torch.zeros((retriever_scores.shape[0], 1), dtype=torch.float32)
+                null_ret_score = torch.zeros((retriever_scores.shape[0], 1), dtype=torch.float32).to(hidden_states.device)
                 attention_bias = torch.cat((retriever_scores, null_ret_score), dim=-1)
                 attention_bias = attention_bias.unsqueeze(-2).unsqueeze(-2)
 
