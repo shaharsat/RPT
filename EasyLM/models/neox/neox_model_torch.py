@@ -454,8 +454,8 @@ class GPTNeoXAttention(nn.Module):
         causal_mask = torch.broadcast_to(causal_mask, (batch,) + causal_mask.shape[1:])
         # TODO: Using views instead?
 
-        print(attention_mask.unsqueeze(1).unsqueeze(1).device)
-        attention_mask = torch.broadcast_to(attention_mask.unsqueeze(1).unsqueeze(1), causal_mask.shape)
+
+        attention_mask = torch.broadcast_to(attention_mask.unsqueeze(1).unsqueeze(1), torch.tensor(causal_mask.shape, device=hidden_states.device))
         attention_mask = combine_masks(attention_mask, causal_mask)
 
         if False: # TODO: Unfalse
