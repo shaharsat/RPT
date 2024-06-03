@@ -389,7 +389,7 @@ class GPTNeoXAttention(nn.Module):
         pad_mask = torch.broadcast_to(
             torch.arange(max_length) < cur_index + num_updated_cache_vectors,
             tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-        )
+        ).to(key.device)
 
         attention_mask = combine_masks(pad_mask, attention_mask)
 
