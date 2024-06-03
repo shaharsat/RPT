@@ -20,7 +20,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model_name = 'neox_rpt_model'
 hf_model = GPTNeoXForCausalLM.from_pretrained('Shahar603/neox-rpt-1')
 hf_model.to(device=device)
-hf_model = torch.nn.DataParallel(hf_model)
 
 evaluation = mteb.MTEB(tasks=[Banking77Classification(hf_subsets=["en"], batch_size=8)])
 results = evaluation.run(hf_model, output_folder=f"results/{model_name}")
