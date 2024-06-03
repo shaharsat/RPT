@@ -529,8 +529,8 @@ def apply_rotary_emb_(
     reshape_xq = xq.type(torch.float32).reshape(*xq.shape[:-1], -1, 2)
     reshape_xk = xk.type(torch.float32).reshape(*xk.shape[:-1], -1, 2)
 
-    xq_ = torch.complex(reshape_xq[..., 0], reshape_xq[..., 1])
-    xk_ = torch.complex(reshape_xk[..., 0], reshape_xk[..., 1])
+    xq_ = torch.complex(reshape_xq[..., 0], reshape_xq[..., 1]).to(xq.device)
+    xk_ = torch.complex(reshape_xk[..., 0], reshape_xk[..., 1]).to(xk.device)
 
     freqs_cis = torch.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
 
