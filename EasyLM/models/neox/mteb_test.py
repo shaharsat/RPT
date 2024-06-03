@@ -21,6 +21,6 @@ model_name = 'neox_rpt_model'
 hf_model = GPTNeoXForCausalLM.from_pretrained('Shahar603/neox-rpt-1')
 hf_model.to(device=device)
 
-evaluation = mteb.MTEB(tasks=[Banking77Classification(hf_subsets=["en"], batch_size=4)])
+evaluation = mteb.MTEB(tasks=[Banking77Classification(hf_subsets=["en"], batch_size=8)])
 results = evaluation.run(hf_model, output_folder=f"results/{model_name}")
 
