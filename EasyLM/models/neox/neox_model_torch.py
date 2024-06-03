@@ -1365,11 +1365,11 @@ class GPTNeoXRetriever(nn.Module):
                                           encoded_output.key_chunks)
 
         if n_skip_chunks > 0:
-            chunk_mask = encoded_output.chunk_mask
+            chunk_mask = encoded_output.chunk_mask.to(encoded_output.device)
             segment_mask = create_segment_mask(query_based_scores.shape[0], n_skip_chunks)
             chunk_mask &= segment_mask
         else:
-            chunk_mask = torch.ones_like(query_based_scores).type(torch.bool)
+            chunk_mask = torch.ones_like(query_based_scores).type(torch.bool).to(encoded_output.device)
         query_score_based_idx = topk_chunks(query_based_scores, num_candidates=num_neighbors, where=chunk_mask)
         return query_based_scores, query_score_based_idx, chunk_mask
 
