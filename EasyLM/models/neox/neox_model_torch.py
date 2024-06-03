@@ -469,7 +469,7 @@ class GPTNeoXAttention(nn.Module):
         present = (key, value) if use_cache else None
 
         # transform boolean mask into float mask
-        attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
+        attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype).to(hidden_states.device)
         attention_bias[attention_mask > 0] = 0.0
 
         # TODO: Add deterministic
