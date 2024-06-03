@@ -509,14 +509,13 @@ def attention_mask_func(attention_scores, ltor_mask):
     return attention_scores
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: torch.dtype = torch.float32,
-                         device=None) -> torch.Tensor:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].type(dtype) / dim))
     t = torch.arange(end)
     freqs = torch.outer(t, freqs).type(dtype)
     sin, cos = torch.sin(freqs), torch.cos(freqs)
     freqs_cis = cos + 1j * sin
-    return torch.tensor(freqs_cis, device=device)
+    return torch.tensor(freqs_cis)
 
 
 def apply_rotary_emb_(
@@ -529,8 +528,8 @@ def apply_rotary_emb_(
     reshape_xq = xq.type(torch.float32).reshape(*xq.shape[:-1], -1, 2)
     reshape_xk = xk.type(torch.float32).reshape(*xk.shape[:-1], -1, 2)
 
-    xq_ = torch.complex(reshape_xq[..., 0], reshape_xq[..., 1]).to(xq.device)
-    xk_ = torch.complex(reshape_xk[..., 0], reshape_xk[..., 1]).to(xk.device)
+    xq_ = torch.complex(reshape_xq[..., 0], reshape_xq[..., 1])
+    xk_ = torch.complex(reshape_xk[..., 0], reshape_xk[..., 1])
 
     freqs_cis = torch.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
 
@@ -618,7 +617,7 @@ class GPTNeoXCrossAttention(nn.Module):
 
         self.freqs_cis = precompute_freqs_cis(
             self.head_dim,
-            config.max_position_embeddings * 2,
+            config.max_position_embeddings * 2
         )
         self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
         self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
@@ -670,7 +669,7 @@ class GPTNeoXCrossAttention(nn.Module):
             position_ids = torch.arange(query_length, dtype=torch.int32)
             position_ids = torch.broadcast_to(position_ids[None, :], (batch_size, query_length)).type(torch.long)
 
-        freqs_cis = self.freqs_cis[position_ids]
+        freqs_cis = self.freqs_cis[position_ids].to(hidden_states.device)
 
         if not is_cross_attention:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype, rot_dim=self.head_dim)
