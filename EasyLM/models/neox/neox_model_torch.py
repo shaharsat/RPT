@@ -686,7 +686,7 @@ class GPTNeoXCrossAttention(nn.Module):
         xv = torch.cat((xv, null_v), dim=-3)
 
         if attention_mask is not None:
-            null_mask = torch.ones((attention_mask.shape[0], 1), dtype=torch.float32)
+            null_mask = torch.ones((attention_mask.shape[0], 1), dtype=torch.float32).to(hidden_states.device)
             attention_mask = torch.cat((attention_mask, null_mask), dim=-1)
             attention_mask = attention_mask.unsqueeze(-2).unsqueeze(-2)
 
