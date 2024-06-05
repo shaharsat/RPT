@@ -801,7 +801,7 @@ class FlaxGPTNeoXAttention(nn.Module):
         # proj q, k, v
         #jax.debug.print('1: hidden_states={x}', x=hidden_states)
         fused_qkv = self.query_key_value(hidden_states)
-        jax.debug.print('2: fused_qkv={x}', x=fused_qkv.shape)
+        #jax.debug.print('2: fused_qkv={x}', x=fused_qkv.shape)
         batch, seq_len, _ = fused_qkv.shape
         fused_qkv = self._split_heads(fused_qkv)
         #jax.debug.print('3: fused_qkv={x}', x=fused_qkv)
@@ -1284,7 +1284,7 @@ class FlaxGPTNeoXChunkedCrossAttention(nn.Module):
 
         causal_padding = chunk_size - 1
         num_devices, seq_len, hidden_dim = hidden_states.shape
-        print(f"{neighbor_hidden_states=}")
+        #print(f"{neighbor_hidden_states=}")
         num_neighbors = neighbor_hidden_states.shape[-3]
         neighbor_hidden_states = neighbor_hidden_states.reshape([-1, 2*chunk_size*num_neighbors, hidden_dim])
         num_document_chunks = neighbor_hidden_states.shape[0]
