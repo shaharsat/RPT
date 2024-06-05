@@ -116,7 +116,7 @@ def batch_lookup_neighbors(query_chunks, memories, num_neighbors, append_next_ch
 
 
 def rename_fields(x):
-    x["input_ids"]=x.pop("input_tokens")
+    x["input_ids"]=x.pop("targets")
     x["attention_mask"] = x["attention_mask"].astype(int)
     return x
 
@@ -140,7 +140,7 @@ def create_prepare_inputs(prefix_tokenizer, input_length):
             prefix_text = prefix_text.split("\n\n")
             inputs = map(tokenize, prefix_text)
         else:
-            inputs = prefix_tokenizer(prefix_text,return_tensors='np')
+            inputs = prefix_tokenizer(prefix_text, return_tensors='np')
             inputs = sliding_window(inputs["input_ids"][0],
                                     width=input_length,
                                     stride=input_length,

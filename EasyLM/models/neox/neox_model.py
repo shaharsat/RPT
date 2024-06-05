@@ -27,6 +27,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ GPTNeoX model configuration"""
+from more_itertools import chunked
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
@@ -96,7 +97,9 @@ class FlaxGreedySearchOutput(ModelOutput):
 from flax.linen import partitioning as nn_partitioning
 from mlxu import function_args_to_config, load_pickle, open_file
 RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])    
-from EasyLM.models.neox.rpt_utils import EncodedNeighbors, new_lookup_neighbors
+from EasyLM.models.neox.rpt_utils import EncodedNeighbors, new_lookup_neighbors, add_batch_index, collate_fn, \
+    create_prepare_inputs
+
 remat = nn_partitioning.remat
 from ml_collections import ConfigDict
 from EasyLM.models.neox.attention import my_dot_product_attention_weights
@@ -796,23 +799,23 @@ class FlaxGPTNeoXAttention(nn.Module):
         # qkv = self.query_key_value(hidden_states)
 
         # proj q, k, v
-        jax.debug.print('1: hidden_states={x}', x=hidden_states)
+        #jax.debug.print('1: hidden_states={x}', x=hidden_states)
         fused_qkv = self.query_key_value(hidden_states)
-        jax.debug.print('2: fused_qkv={x}', x=fused_qkv)
+        jax.debug.print('2: fused_qkv={x}', x=fused_qkv.shape)
         batch, seq_len, _ = fused_qkv.shape
         fused_qkv = self._split_heads(fused_qkv)
-        jax.debug.print('3: fused_qkv={x}', x=fused_qkv)
+        #jax.debug.print('3: fused_qkv={x}', x=fused_qkv)
         query, key, value = jnp.split(fused_qkv, 3, axis=-1)
-        jax.debug.print('4: query={x}', x=query)
-        jax.debug.print('4: key={x}', x=key)
-        jax.debug.print('4: value={x}', x=value)
+        #jax.debug.print('4: query={x}', x=query)
+        #jax.debug.print('4: key={x}', x=key)
+        #jax.debug.print('4: value={x}', x=value)
         # key = with_sharding_constraint(key, PS(("dp", "fsdp"), None, "mp"))
         # value = with_sharding_constraint(value, PS(("dp", "fsdp"), None, "mp"))
 
         cos, sin = self.rotary_emb(seq_len)
 
-        jax.debug.print('5: cos={x}', x=cos)
-        jax.debug.print('5: sin={x}', x=sin)
+        #jax.debug.print('5: cos={x}', x=cos)
+        #jax.debug.print('5: sin={x}', x=sin)
         if self.rotary_ndims is not None:
             k_rot = key[..., : self.rotary_ndims]
             k_pass = key[..., self.rotary_ndims :]
@@ -820,22 +823,22 @@ class FlaxGPTNeoXAttention(nn.Module):
             q_rot = query[..., : self.rotary_ndims]
             q_pass = query[..., self.rotary_ndims :]
 
-            jax.debug.print('6: k_rot={x}', x=k_rot)
-            jax.debug.print('6: k_pass={x}', x=k_pass)
+            #jax.debug.print('6: k_rot={x}', x=k_rot)
+            #jax.debug.print('6: k_pass={x}', x=k_pass)
 
-            jax.debug.print('6: q_rot={x}', x=q_rot)
-            jax.debug.print('6: q_pass={x}', x=q_pass)
+            #jax.debug.print('6: q_rot={x}', x=q_rot)
+            #jax.debug.print('6: q_pass={x}', x=q_pass)
 
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin, position_ids)
 
-            jax.debug.print('7: q_rot={x}', x=q_rot)
-            jax.debug.print('7: q_pass={x}', x=q_pass)
+            #jax.debug.print('7: q_rot={x}', x=q_rot)
+            #jax.debug.print('7: q_pass={x}', x=q_pass)
 
             key = jnp.concatenate([k_rot, k_pass], axis=-1)
             query = jnp.concatenate([q_rot, q_pass], axis=-1)
 
-            jax.debug.print('8: key={x}', x=key)
-            jax.debug.print('8: query={x}', x=query)
+            #jax.debug.print('8: key={x}', x=key)
+            #jax.debug.print('8: query={x}', x=query)
         else:
             query, key = apply_rotary_pos_emb(query, key, cos, sin, position_ids)
         query = query.astype(self.dtype)
@@ -875,9 +878,9 @@ class FlaxGPTNeoXAttention(nn.Module):
             jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
         )
 
-        jax.debug.print('9: query={x}', x=query)
-        jax.debug.print('9: key={x}', x=key)
-        jax.debug.print('9: attention_bias={x}', x=attention_bias)
+        #jax.debug.print('9: query={x}', x=query)
+        #jax.debug.print('9: key={x}', x=key)
+        #jax.debug.print('9: attention_bias={x}', x=attention_bias)
 
         # if False:
         attn_weights = my_dot_product_attention_weights(
@@ -892,7 +895,7 @@ class FlaxGPTNeoXAttention(nn.Module):
             apply_tanh=self.config.tanh_causal_att,
         )
 
-        jax.debug.print('10: attn_weights={x}', x=attn_weights)
+        #jax.debug.print('10: attn_weights={x}', x=attn_weights)
 
         # print()
         # attn_weights = with_sharding_constraint(attn_weights, PS(("dp", "fsdp"), "mp", None, None))
@@ -1094,15 +1097,15 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
 
         is_cross_attention = key_value_states is not None
 
-        jax.debug.print('A1: hidden_states={x}', x=hidden_states)
+        #jax.debug.print('A1: hidden_states={x}', x=hidden_states)
 
         xq = self.wq(hidden_states)
-        jax.debug.print('A2.1: xq={x}', x=xq)
+        #jax.debug.print('A2.1: xq={x}', x=xq)
         xq = self._split_heads(xq).astype(self.dtype)
-        jax.debug.print('A2.2: xq={x}', x=xq)
+        #jax.debug.print('A2.2: xq={x}', x=xq)
         xq = self.q_layernorm(xq) if self.qk_layernorm else xq
 
-        jax.debug.print('A2: xq={x}', x=xq)
+        #jax.debug.print('A2: xq={x}', x=xq)
 
         if not is_cross_attention:
             key_value_states = hidden_states
@@ -1117,17 +1120,17 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
         xk = self._split_heads(xk).astype(self.dtype)
         xk = self.k_layernorm(xk) if self.qk_layernorm else xk
 
-        jax.debug.print('A3: xk={x}', x=xk)
+        #jax.debug.print('A3: xk={x}', x=xk)
 
         xv = self.wv(key_value_states)
         xv = self._split_heads(xv).astype(self.dtype)
 
-        jax.debug.print('A4: xv={x}', x=xv)
+        #jax.debug.print('A4: xv={x}', x=xv)
 
 
         null_k = self.k_layernorm(self.null_k) if self.qk_layernorm else self.null_k
 
-        jax.debug.print('A5: null_k={x}', x=null_k)
+        #jax.debug.print('A5: null_k={x}', x=null_k)
 
         query_length, key_length = xq.shape[1], xk.shape[1]
         batch_size = hidden_states.shape[0]
@@ -1137,11 +1140,11 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
             position_ids = jnp.arange(query_length, dtype=jnp.int32)
             position_ids = jnp.broadcast_to(position_ids[None, :], (batch_size, query_length))
 
-        jax.debug.print('A6: position_ids={x}', x=position_ids)
+        #jax.debug.print('A6: position_ids={x}', x=position_ids)
 
         freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
 
-        jax.debug.print('A7: freqs_cis={x}', x=freqs_cis)
+        #jax.debug.print('A7: freqs_cis={x}', x=freqs_cis)
 
         if not is_cross_attention:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype, rot_dim=self.head_dim)
@@ -1152,16 +1155,16 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
             freqs_cis_k = jnp.take(self.freqs_cis, kv_position_ids, axis=0)
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, freqs_cis_k=freqs_cis_k, dtype=self.dtype, rot_dim=self.head_dim)
 
-        jax.debug.print('A8: xq={x}', x=xq)
-        jax.debug.print('A8: xk={x}', x=xk)
+        #jax.debug.print('A8: xq={x}', x=xq)
+        #jax.debug.print('A8: xk={x}', x=xk)
 
         null_k = jnp.broadcast_to(null_k, (batch_size, 1, self.num_heads, self.head_dim)).astype(self.dtype)
         xk = jnp.concatenate((xk, null_k), axis = -3)
         null_v = jnp.broadcast_to(self.null_v, (batch_size, 1, self.num_heads, self.head_dim)).astype(self.dtype)
         xv = jnp.concatenate((xv, null_v), axis = -3)
 
-        jax.debug.print('A9: xk={x}', x=xk)
-        jax.debug.print('A9: xv={x}', x=xv)
+        #jax.debug.print('A9: xk={x}', x=xk)
+        #jax.debug.print('A9: xv={x}', x=xv)
 
         if attention_mask is not None:
 
@@ -1191,7 +1194,7 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
         if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-        jax.debug.print('A10: attention_bias={x}', x=attention_bias)
+        #jax.debug.print('A10: attention_bias={x}', x=attention_bias)
 
         attn_weights = my_dot_product_attention_weights(
             xq,
@@ -1205,17 +1208,17 @@ class FlaxGPTNeoXCrossAttention(nn.Module):
             apply_tanh=self.config.tanh_xatt,
         ).astype(self.dtype)
 
-        jax.debug.print('A11: attn_weights={x}', x=attn_weights)
+        #jax.debug.print('A11: attn_weights={x}', x=attn_weights)
 
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv.astype(self.dtype), precision=self.precision)
 
-        jax.debug.print('A12: attn_output={x}', x=attn_output)
+        #jax.debug.print('A12: attn_output={x}', x=attn_output)
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output).astype(self.dtype)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
 
-        jax.debug.print('A13: outputs={x}', x=outputs)
+        #jax.debug.print('A13: outputs={x}', x=outputs)
 
         return outputs
 
@@ -1510,9 +1513,9 @@ class FlaxGPTNeoXBlock(nn.Module):
             cca_hidden_states = None
 
 
-        jax.debug.print('sum={x}', x=jnp.sum(hidden_states))
+        #jax.debug.print('sum={x}', x=jnp.sum(hidden_states))
         att_input = self.input_layernorm(hidden_states).astype(self.dtype)
-        jax.debug.print('att_input={x}', x=att_input)
+        #jax.debug.print('att_input={x}', x=att_input)
         #print(f"{att_input=}",flush=True)
         # att_input = with_sharding_constraint(att_input, PS(("dp", "fsdp"), None, "mp"))
         # attention_mask = with_sharding_constraint(attention_mask, PS(("dp", "fsdp"), None))
@@ -2278,11 +2281,11 @@ class FlaxGPTNeoXModule(nn.Module):
         ):
         input_embeds = self.embed_in(input_ids.astype("i4"))
 
-        jax.debug.print('input_embeds={x}', x=input_embeds)
+        #jax.debug.print('input_embeds={x}', x=input_embeds)
 
         hidden_states = self.emb_dropout(input_embeds, deterministic=deterministic)
 
-        jax.debug.print('emb_dropout={x}', x=hidden_states)
+        #jax.debug.print('emb_dropout={x}', x=hidden_states)
 
         lowcoder_outputs = self.layers(
             hidden_states,
@@ -2381,7 +2384,7 @@ class FlaxGPTNeoXModule(nn.Module):
         input_embeds = self.embed_in(input_ids.astype("i4"))
         hidden_states = self.emb_dropout(input_embeds, deterministic=deterministic)
 
-        jax.debug.print('emb_dropout: {x}', x=hidden_states)
+        #jax.debug.print('emb_dropout: {x}', x=hidden_states)
 
         def lowcoder(hidden_states, attention_mask, position_ids):
             return self.layers(
@@ -2496,6 +2499,7 @@ append_call_sample_docstring(
 )
 
 
+
 class FlaxGPTNeoXForCausalLMModule(nn.Module):
     config: GPTNeoXConfig
     dtype: jnp.dtype = jnp.float32
@@ -2511,6 +2515,9 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
         )
+
+
+
     def _lowcoder_forward(self, input_ids, attention_mask, position_ids, deterministic, output_attentions):
 
         if attention_mask is None:
@@ -2638,6 +2645,57 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
             output = jax.tree_map(lambda x: x.squeeze(0), output)
         return output
 
+    def create_apply_kwargs(self, params, dropout_rng, past_key_values=None):
+        rngs = {}
+        # Handle any PRNG if needed
+        if dropout_rng is not None:
+            rngs["dropout"] = dropout_rng
+
+        variables = {"params": params or self.params}
+
+        # if past_key_values are passed then cache is already initialized a private flag init_cache
+        # has to be passed down to ensure cache is used. It has to be made sure that cache is marked as mutable
+        # so that it can be changed by FlaxGPTJAttention module
+        if past_key_values is not None:
+            variables["cache"] = past_key_values
+            mutable = ["cache","intermediates"]
+        else:
+            mutable = False
+        return dict(rngs=rngs, variables=variables, mutable=mutable)
+
+    def collate_fn(self, batch):
+        input_ids = np.array([[x["input_ids"] for x in batch]])
+        attention_mask = np.array([[x["attention_mask"] for x in batch]])
+        return input_ids, attention_mask
+
+    def encode(self, params, text, batch_size=64, split_by_newline=False):
+        prefix_tokenizer = self.config.get_tokenizer(truncation_side='left', padding_side='left')
+        prepare_inputs = create_prepare_inputs(prefix_tokenizer, input_length=2048) # TODO: 2048 ?
+        inputs = [prepare_inputs(prefix, split_by_newline) for prefix in text]
+        inputs = [add_batch_index(x,j) for j,x in enumerate(inputs)]
+        inputs = sum(inputs,[])
+
+        outputs = []
+        for i, batch in enumerate(chunked(inputs, batch_size)):
+            print(f'{batch[-1]["batch_index"]+1}/{len(inputs)}')
+            input_ids, attention_mask = self.collate_fn(batch)
+            apply_kwargs = self.create_apply_kwargs(params, None, None)
+
+            encoded_output = self.apply(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=None,
+                deterministic=True,
+                output_attentions=False,
+                method=self._lowcoder_forward,
+                **apply_kwargs
+        )
+            for key in encoded_output['key_chunks']:
+                outputs.append(key)
+
+        return np.array(outputs)
+
+
 @add_start_docstrings(
     """
     The GPTNeoX Model transformer with a language modeling head on top.
@@ -2694,6 +2752,9 @@ class FlaxGPTNeoXForCausalLM(FlaxGPTNeoXPreTrainedModel):
                                         )
 
         return model_kwargs
+
+    def encode(self, text, batch_size):
+        return self.module.encode(self.params, text, batch_size)
 
 
 append_call_sample_docstring(
@@ -2942,16 +3003,16 @@ class FlaxGPTNeoXRetriever(nn.Module):
         original_attention_mask_shape = attention_mask.shape
         # print(hidden_states.shape)
 
-        jax.debug.print('11: hidden_states={x}', x=hidden_states)
-        jax.debug.print('11: attention_mask={x}', x=attention_mask)
+        #jax.debug.print('11: hidden_states={x}', x=hidden_states)
+        #jax.debug.print('11: attention_mask={x}', x=attention_mask)
         
         original_hidden_states, attention_mask = jax.tree_map(
                 lambda x: einops.rearrange(x, 'b (l c) ... -> (b l) c ... ', c=pooling_size), 
                 (hidden_states, attention_mask)
                 ) # add a chunk dimension
 
-        jax.debug.print('12: hidden_states={x}', x=hidden_states)
-        jax.debug.print('12: attention_mask={x}', x=attention_mask)
+        #jax.debug.print('12: hidden_states={x}', x=hidden_states)
+        #jax.debug.print('12: attention_mask={x}', x=attention_mask)
 
         #1. apply bi-dir attention 
         preret_bi_output  = self.preret_bidir_attention(
@@ -2960,16 +3021,16 @@ class FlaxGPTNeoXRetriever(nn.Module):
                                                 deterministic=deterministic,
                                                 output_attentions=output_attentions)
 
-        jax.debug.print('13: preret_bi_output={x}', x=preret_bi_output[0])
+        #jax.debug.print('13: preret_bi_output={x}', x=preret_bi_output[0])
 
         encoded_hidden_states = preret_bi_output[0] + original_hidden_states
 
-        jax.debug.print('14: encoded_hidden_states={x}', x=encoded_hidden_states)
+        #jax.debug.print('14: encoded_hidden_states={x}', x=encoded_hidden_states)
         
         #2. pool
         pooled_hidden_states = encoded_hidden_states.mean(axis=-2)
 
-        jax.debug.print('15: pooled_hidden_states={x}', x=pooled_hidden_states)
+        #jax.debug.print('15: pooled_hidden_states={x}', x=pooled_hidden_states)
         
         #3. project to query chunks and key chunks
         key_chunks = self.key_projection(self.pre_key_norm(pooled_hidden_states))
@@ -2978,22 +3039,22 @@ class FlaxGPTNeoXRetriever(nn.Module):
         if chunk_mask.shape[0]!=pooled_hidden_states.shape[0]:
             chunk_mask = chunk_mask[:pooled_hidden_states.shape[0],...]
 
-        jax.debug.print('16: key_chunks={x}', x=key_chunks)
-        jax.debug.print('16: query_chunks={x}', x=query_chunks)
-        jax.debug.print('16: chunk_mask={x}', x=chunk_mask)
+        #jax.debug.print('16: key_chunks={x}', x=key_chunks)
+        #jax.debug.print('16: query_chunks={x}', x=query_chunks)
+        #jax.debug.print('16: chunk_mask={x}', x=chunk_mask)
             
         # nei_pos = jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0, a_max=2*self.config.chunk_size-1)
         original_hidden_states = original_hidden_states.reshape(original_hidden_states_shape)
         attention_mask = attention_mask.reshape(original_attention_mask_shape)
 
-        jax.debug.print('17: original_hidden_states={x}', x=original_hidden_states)
-        jax.debug.print('17: attention_mask={x}', x=attention_mask)
+        #jax.debug.print('17: original_hidden_states={x}', x=original_hidden_states)
+        #jax.debug.print('17: attention_mask={x}', x=attention_mask)
             
         key_chunks = key_chunks/jnp.linalg.norm(key_chunks,axis=-1,keepdims=True)
         query_chunks = query_chunks/jnp.linalg.norm(query_chunks,axis=-1,keepdims=True)
 
-        jax.debug.print('18: key_chunks={x}', x=key_chunks)
-        jax.debug.print('18: query_chunks={x}', x=query_chunks)
+        #jax.debug.print('18: key_chunks={x}', x=key_chunks)
+        #jax.debug.print('18: query_chunks={x}', x=query_chunks)
         
         return FlaxGPTNeoXRetrieverEncodedOutput(
                                             original_hidden_states=original_hidden_states,

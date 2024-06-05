@@ -2600,7 +2600,7 @@ class GPTNeoXForCausalLMModule(GPTNeoXPreTrainedModel):
         inputs = sum(inputs,[])
         def collate_fn(batch):
             with torch.no_grad():
-                input_ids = torch.tensor(np.array([x["input_ids"].squeeze() for x in batch]), device=self.device)
+                input_ids = torch.tensor(np.array([x["targets"].squeeze() for x in batch]), device=self.device)
                 attention_mask = torch.tensor(np.array([x["attention_mask"].squeeze() for x in batch]), device=self.device)
                 return input_ids, attention_mask
 
