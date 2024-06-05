@@ -8,11 +8,9 @@ from EasyLM.models.neox.neox_model_torch import GPTNeoXForCausalLM
 import mteb
 
 
-"""
 hf_model = GPTNeoXForCausalLM.from_pretrained(
     pretrained_model_name_or_path='/Users/shahar.satamkar/Desktop/Masters/RPT/EasyLM/models/neox/neox_model_torch'
 )
-"""
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
